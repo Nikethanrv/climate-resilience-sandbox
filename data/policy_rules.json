@@ -1,0 +1,11 @@
+{
+  "critical_drought": {
+    "trigger": "critical",
+    "title": "Critical Drought Response",
+    "actions": [
+      "Activate groundwater conservation",
+      "Prioritize drinking water supply",
+      "Deploy drought-resistant crops"
+    ]
+  }
+}
