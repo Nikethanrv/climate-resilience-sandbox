@@ -1,6 +1,35 @@
 {
-  "project_name": "Climate Resilience Sandbox",
-  "version": "0.1",
-  "pilot_region": "Tamil Nadu",
-  "last_updated": "2026-06-08"
+  "knowledge_base_version": "0.1",
+  "last_updated": "2026-06-09",
+  "sources": [
+    {
+      "title": "Manual for Drought Management",
+      "organization": "Ministry of Agriculture and Farmers Welfare",
+      "year": 2020
+    },
+    {
+      "title": "Management of Drought",
+      "organization": "NDMA",
+      "year": 2010
+    },
+    {
+      "title": "Plan to Counter the Threats to Municipal Water Supply and Water Reservoirs",
+      "organization": "NDMA",
+      "year": 2010
+    },
+    {
+      "title": "Developing Farming Systems and Best Practices for Drought-Prone Areas",
+      "organization": "FAO"
+    },
+    {
+      "title": "Frequently Asked Questions on Monsoon",
+      "organization": "IMD",
+      "year": 2020
+    },
+    {
+      "title": "El Niño Preparedness and Response Situation Report",
+      "organization": "FAO",
+      "year": 2016
+    }
+  ]
 }
