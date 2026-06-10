@@ -32,29 +32,40 @@
       "year": 2016
     },
     {
-      "title": "www.fao.org/agrifood-economics/areas-of-work/rima/en/",
-      "organization": "FAO RIMA"
+      "id": "rima_fao",
+      "title": "FAO Resilience Index Measurement and Analysis (RIMA)",
+      "url": "https://www.fao.org/agrifood-economics/areas-of-work/rima/en/",
+      "relevance": "Methodological basis for weighted composite resilience scoring"
     },
     {
-      "title": "https://drmkc.jrc.ec.europa.eu/inform-index",
-      "organization": "INFORM Severity Index"
+      "id": "inform_severity",
+      "title": "INFORM Severity Index Concept and Methodology",
+      "url": "https://drmkc.jrc.ec.europa.eu/inform-index",
+      "relevance": "Precedent for expert-defined pillar weightings in composite humanitarian risk indices"
     },
     {
-      "title": "https://www.sciencedirect.com/science/article/pii/S2665972721000258",
-      "organization": "WEF Composite Index"
+      "id": "wef_composite",
+      "title": "Development of a prototype composite index for resilience and security of water-energy-food systems",
+      "url": "https://www.sciencedirect.com/science/article/pii/S2665972721000258",
+      "relevance": "Composite WEF resilience index methodology using weighted sub-indicators"
     },
     {
-      "title": "https://agupubs.onlinelibrary.wiley.com/doi/full/10.1029/2020GL087255",
-      "organization": "Nair et al.",
-      "year": 2021
+      "id": "nair_2021",
+      "title": "Assessment of Groundwater Sustainability and Identifying Factors Inducing Groundwater Depletion in India",
+      "url": "https://agupubs.onlinelibrary.wiley.com/doi/full/10.1029/2020GL087255",
+      "relevance": "CGWB-based evidence linking reduced rainfall to groundwater depletion in India"
     },
     {
-      "title": "https://www.fao.org/climatechange/asis/en/",
-      "organization": "FAO ASIS"
+      "id": "fao_asis",
+      "title": "FAO Agricultural Stress Index System (ASIS)",
+      "url": "https://www.fao.org/climatechange/asis/en/",
+      "relevance": "Basis for combining vegetation stress and rainfall indicators in agricultural drought assessment"
     },
     {
-      "title": "https://www.tandfonline.com/doi/full/10.1080/23311932.2025.2525319",
-      "organization": "Agricultural drought mapping study"
+      "id": "tandfonline_2025",
+      "title": "Mapping drought risks in agriculture: a GIS and remote sensing study",
+      "url": "https://www.tandfonline.com/doi/full/10.1080/23311932.2025.2525319",
+      "relevance": "Validates r=0.74 correlation between rainfall deficits and crop yield anomalies"
     }
   ]
 }

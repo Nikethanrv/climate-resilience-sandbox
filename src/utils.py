@@ -35,18 +35,18 @@ def calculate_zscore(value, mean, std):
 def classify_risk(zscore):
     """
     Map Z-score to risk category.
-    Thresholds follow standard statistical conventions:
-      Z > -0.5  → Normal
-      Z > -1.0  → Elevated Risk
-      Z > -2.0  → Severe Stress
-      Z <= -2.0 → Critical Resource Alert
-    These will be calibrated and stored in risk_thresholds.json in Phase 3.
+    Thresholds based on IMD's SPI-based drought classification framework.
+    
+    Normal:        Z > -0.5
+    Elevated Risk: -1.0 < Z <= -0.5
+    Severe Stress: -1.5 < Z <= -1.0
+    Critical:      Z <= -1.5
     """
     if zscore > -0.5:
         return "Normal"
     elif zscore > -1.0:
         return "Elevated Risk"
-    elif zscore > -2.0:
+    elif zscore > -1.5:
         return "Severe Stress"
     else:
         return "Critical Resource Alert"

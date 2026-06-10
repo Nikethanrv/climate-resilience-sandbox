@@ -1,4 +1,41 @@
 {
-  "status": "placeholder",
-  "notes": "Thresholds will be calibrated after model training and validation."
+  "version": "1.0",
+  "calibrated_from": "historical_statistics.json",
+  "reference_period": "1991-2017",
+  "classification_reference": "IMD Standardized Precipitation Index (SPI) drought classification framework",
+  "zscore_thresholds": {
+    "normal":   -0.5,
+    "elevated": -1.0,
+    "severe":   -1.5,
+    "critical": -1.5
+  },
+  "crop_yield_stability": {
+    "unit": "Kg/ha",
+    "historical_mean": 3436.9024,
+    "historical_std": 391.5507,
+    "thresholds": {
+      "normal":   3241.12,
+      "elevated": 3045.35,
+      "severe":   2849.57,
+      "critical": 2849.57
+    }
+  },
+  "water_reservoir_security": {
+    "unit": "percent_capacity",
+    "historical_mean": 45.3265,
+    "historical_std": 13.446,
+    "thresholds": {
+      "normal":   38.60,
+      "elevated": 31.88,
+      "severe":   25.15,
+      "critical": 25.15
+    }
+  },
+  "out_of_distribution_bounds": {
+    "oni_djf":               {"min": -1.7,  "max": 2.6},
+    "rainfall_jjas":         {"min": 94.2,  "max": 434.3},
+    "rainfall_ond":          {"min": 149.3, "max": 782.3},
+    "reservoir_storage_pct": {"min": 24.14, "max": 66.50}
+  },
+  "data_note": "Reservoir data for 1991-1999 imputed with historical mean due to missing CWC records. This reduces variance in early-period water risk classifications."
 }
