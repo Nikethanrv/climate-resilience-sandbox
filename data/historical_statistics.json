@@ -1,0 +1,34 @@
+{
+  "crop_yield_stability": {
+    "name": "Crop Yield Stability",
+    "mean": 3436.9024,
+    "std": 391.5507,
+    "min": 2914.9735,
+    "max": 4115.5889,
+    "p25": 3042.1143,
+    "p50": 3442.3003,
+    "p75": 3617.4791
+  },
+  "water_reservoir_security": {
+    "name": "Water Reservoir Security",
+    "mean": 45.3265,
+    "std": 13.446,
+    "min": 24.1445,
+    "max": 66.5007,
+    "p25": 32.5778,
+    "p50": 48.0024,
+    "p75": 48.9515
+  },
+  "evaluation_metrics": {
+    "crop_model": {
+      "MAE": 265.8843,
+      "RMSE": 334.028,
+      "R2": 0.5192
+    },
+    "water_model": {
+      "MAE": 3.9866,
+      "RMSE": 6.2241,
+      "R2": 0.834
+    }
+  }
+}
