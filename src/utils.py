@@ -172,3 +172,47 @@ def evaluate_scenario(crop_pred, water_pred, rainfall_ond, stats, policy_rules):
         "water_zscore":            round(water_z, 4),
         "recommendations":         recommendations,
     }
+
+# ── 10. PREPROCESSING MAPPING LAYER ──────────────────────────────────────────
+
+def map_ui_inputs_to_features(sst_anomaly, rainfall_deficit_pct, 
+                               drought_duration, heat_stress, 
+                               reservoir_storage_pct, year=2004):
+    """
+    Converts user-facing UI slider values to model input features.
+    
+    UI Inputs:
+        sst_anomaly         : float, range 0.0 to +3.5°C (maps to ONI)
+        rainfall_deficit_pct: float, 0–100% deficit (maps to rainfall depression)
+        drought_duration    : int,   0–12 months (multiplier on rainfall deficit)
+        heat_stress         : int,   1–5 scale (composite with ONI)
+        reservoir_storage_pct: float, 0–100% (passed through directly)
+        year                : int,   fixed at 2004 (historical midpoint)
+    
+    Returns:
+        dict of model-ready features
+    """
+    # ONI: SST anomaly maps directly
+    # Historical ONI range in dataset: -1.7 to 2.6
+    oni_djf = sst_anomaly * (2.6 / 3.5)
+
+    # Rainfall JJAS: apply deficit % to historical mean
+    # Historical mean JJAS: 311.1mm
+    rainfall_jjas_mean = 311.1
+    rainfall_jjas = rainfall_jjas_mean * (1 - rainfall_deficit_pct / 100)
+
+    # Rainfall OND: apply deficit % with drought duration multiplier
+    # Historical mean OND: 445.5mm
+    # Longer drought duration = deeper OND deficit
+    rainfall_ond_mean = 445.5
+    duration_multiplier = 1 + (drought_duration / 12) * 0.5
+    rainfall_ond = rainfall_ond_mean * (1 - (rainfall_deficit_pct / 100) * duration_multiplier)
+    rainfall_ond = max(rainfall_ond, 0)
+
+    return {
+        "oni_djf":               round(oni_djf, 4),
+        "rainfall_jjas":         round(rainfall_jjas, 2),
+        "rainfall_ond":          round(rainfall_ond, 2),
+        "reservoir_storage_pct": round(reservoir_storage_pct, 2),
+        "year":                  year
+    }

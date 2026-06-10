@@ -1,4 +1,4 @@
-from utils import load_historical_stats, evaluate_scenario, load_policy_rules
+from src.utils import load_historical_stats, evaluate_scenario, load_policy_rules
 
 stats = load_historical_stats()
 policy_rules = load_policy_rules()
