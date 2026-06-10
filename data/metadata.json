@@ -32,6 +32,28 @@
       "year": 2016
     },
     {
+      "source_name": "Indian Meteorological Department (IMD)",
+      "url": "https://mausam.imd.gov.in/index_en.php",
+      "description": "Subdivision-wide historical rainfall statistics for Tamil Nadu."
+    },
+    {
+      "source_name": "NOAA Climate Prediction Center",
+      "url": "https://www.cpc.ncep.noaa.gov/products/analysis_monitoring/ensostuff/ONI_v5.php",
+      "description": "Oceanic Niño Index (ONI) monitoring sea surface temperature anomalies in the tropical Pacific to identify El Niño and La Niña conditions."
+    },
+    {
+      "source_name": "India Water Resources Information System (India-WRIS)",
+      "monitoring_agency": "Central Water Commission (CWC)",
+      "data_provider": "National Water Informatics Centre (NWIC)",
+      "url": "https://indiawris.gov.in/wris/#/",
+      "description": "Yearly time-series data for water levels and live storage in major reservoirs [5]."
+    },
+    {
+      "source_name": "ICRISAT District Level Data (DLD)",
+      "url": "http://data.icrisat.org/dld/src/crops.html",
+      "description": "Historical record of agricultural production and yield across various districts in Tamil Nadu"
+    },
+    {
       "id": "rima_fao",
       "title": "FAO Resilience Index Measurement and Analysis (RIMA)",
       "url": "https://www.fao.org/agrifood-economics/areas-of-work/rima/en/",
