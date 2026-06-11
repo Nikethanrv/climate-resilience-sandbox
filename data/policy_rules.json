@@ -1,11 +1,154 @@
 {
-  "critical_drought": {
-    "trigger": "critical",
-    "title": "Critical Drought Response",
-    "actions": [
-      "Activate groundwater conservation",
-      "Prioritize drinking water supply",
-      "Deploy drought-resistant crops"
+  "last_updated": "2026-06-09",
+  "framework_type": "project_defined_planning_categories",
+  "normal": {
+    "title": "Normal",
+    "description": "Rainfall within +/-19% of average. Routine preparedness, infrastructure maintenance, and regular vulnerability assessments are performed well before monsoon onset to ensure long-term resource stability.",
+    "recommendations": [
+      {
+        "id": "normal_001",
+        "text": "Infrastructure repair and augmentation (pumps, pipelines, etc.)",
+        "source": "Manual for Drought Management (2020)",
+        "category": "infrastructure"
+      },
+      {
+        "id": "normal_002",
+        "text": "Shift to perennial grasses, legumes, and woody trees",
+        "source": "Developing Farming Systems and Best Practices for Drought-Prone Areas",
+        "category": "agriculture"
+      },
+      {
+        "id": "normal_003",
+        "text": "Asset Documentation / Vulnerability Assessments",
+        "source": "Plan to Counter the Threats to Municipal Water Supply and Water Reservoirs",
+        "category": "preparedness"
+      },
+      {
+        "id": "normal_004",
+        "text": "Deep tillage (25-30 cm)",
+        "source": "Developing Farming Systems and Best Practices for Drought-Prone Areas",
+        "category": "agriculture"
+      }
+    ]
+  },
+  "elevated": {
+    "title": "Elevated",
+    "description": "Triggered by erratic rainfall, moisture stress, or moderate deficits. Tactical mid-season adaptations and contingency plan updates are implemented to help crops survive temporary dry spells.",
+    "recommendations": [
+      {
+        "id": "elevated_001",
+        "text": "Shift to short-duration and less water-intensive crops",
+        "source": "Manual for Drought Management (2020)",
+        "category": "agriculture"
+      },
+      {
+        "id": "elevated_002",
+        "text": "Thinning plant populations and intensive weed management",
+        "source": "Manual for Drought Management (2020)",
+        "category": "agriculture"
+      },
+      {
+        "id": "elevated_003",
+        "text": "Update District Agriculture Contingency Plans (DACPs)",
+        "source": "Manual for Drought Management (2020)",
+        "category": "preparedness"
+      },
+      {
+        "id": "elevated_004",
+        "text": "Replacing rice with alternative drought-hardy crops",
+        "source": "Developing Farming Systems and Best Practices for Drought-Prone Areas",
+        "category": "agriculture"
+      },
+      {
+        "id": "elevated_005",
+        "text": "Use of chemical retardants for evaporation control",
+        "source": "Manual for Drought Management (2020)",
+        "category": "water_management"
+      }
+    ]
+  },
+  "severe": {
+    "title": "Severe",
+    "description": "Significant rainfall deficits exceeding 50% causing economic distress. Focuses on life-saving irrigation, emergency livestock management, and relief employment to prevent widespread asset loss.",
+    "recommendations": [
+      {
+        "id": "severe_001",
+        "text": "Shelf of public works projects (MGNREGS)",
+        "source": "Manual for Drought Management (2020)",
+        "category": "emergency_response"
+      },
+      {
+        "id": "severe_002",
+        "text": "Judicious use of surface and groundwater (Drip/Sprinkler)",
+        "source": "National Disaster Management Guidelines: Management of Drought (2010)",
+        "category": "water_management"
+      },
+      {
+        "id": "severe_003",
+        "text": "Cattle camps and fodder banks",
+        "source": "Manual for Drought Management (2020)",
+        "category": "livestock"
+      },
+      {
+        "id": "severe_004",
+        "text": "Provision of consumption loans",
+        "source": "National Disaster Management Guidelines: Management of Drought (2010)",
+        "category": "emergency_response"
+      },
+      {
+        "id": "severe_005",
+        "text": "Supplemental irrigation (20 mm)",
+        "source": "Developing Farming Systems and Best Practices for Drought-Prone Areas",
+        "category": "water_management"
+      },
+      {
+        "id": "severe_006",
+        "text": "Animal Health Campaigns / Strategic Destocking",
+        "source": "El Niño Preparedness and Response Situation Report (2016)",
+        "category": "livestock"
+      }
+    ]
+  },
+  "critical": {
+    "title": "Critical",
+    "description": "Conditions of acute scarcity or confirmed contamination. Requires immediate emergency water supply, nutritional intervention for malnourished populations, and urgent protection against catastrophic resource failure.",
+    "recommendations": [
+      {
+        "id": "critical_001",
+        "text": "Emergency water supply (tankers, railways, etc.)",
+        "source": "Manual for Drought Management (2020)",
+        "category": "emergency_response"
+      },
+      {
+        "id": "critical_002",
+        "text": "Expansion of ICDS and Mid-Day Meal schemes",
+        "source": "National Disaster Management Guidelines: Management of Drought (2010)",
+        "category": "emergency_response"
+      },
+      {
+        "id": "critical_003",
+        "text": "Immediate Suspension of water supply",
+        "source": "Plan to Counter the Threats to Municipal Water Supply and Water Reservoirs",
+        "category": "emergency_response"
+      },
+      {
+        "id": "critical_004",
+        "text": "Mobile Purification Units (Reverse Osmosis)",
+        "source": "Plan to Counter the Threats to Municipal Water Supply and Water Reservoirs",
+        "category": "water_management"
+      },
+      {
+        "id": "critical_005",
+        "text": "Containment and Isolation (Shut-off valves)",
+        "source": "Plan to Counter the Threats to Municipal Water Supply and Water Reservoirs",
+        "category": "infrastructure"
+      },
+      {
+        "id": "critical_006",
+        "text": "Repairing river embankments",
+        "source": "El Niño Preparedness and Response Situation Report (2016)",
+        "category": "infrastructure"
+      }
     ]
   }
 }

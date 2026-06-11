@@ -1,0 +1,56 @@
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Build files
+build/
+dist/
+*.egg-info/
+
+# IDEs
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Environment variables
+.env
+.env.*
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Model artifacts (optional)
+# Uncomment if models become large
+# models/*.joblib
+
+# Temporary files
+*.tmp
+*.temp
+
+# Test cache
+.pytest_cache/
+
+# Coverage reports
+.coverage
+htmlcov/
+
+# Local datasets you DON'T want tracked
+# data/raw/
+
+# Keep generated data tracked if needed
+# !data/historical_climate_data.csv

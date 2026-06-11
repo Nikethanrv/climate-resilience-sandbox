@@ -1,18 +1,4 @@
 {
-  "normal": {
-    "z_min": -1.0,
-    "label": "Normal Conditions"
-  },
-  "elevated": {
-    "z_min": -2.0,
-    "label": "Elevated Risk"
-  },
-  "severe": {
-    "z_min": -3.0,
-    "label": "Severe Stress"
-  },
-  "critical": {
-    "z_min": -999,
-    "label": "Critical Resource Alert"
-  }
+  "status": "placeholder",
+  "notes": "Thresholds will be calibrated after model training and validation."
 }
