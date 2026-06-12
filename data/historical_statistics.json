@@ -1,4 +1,53 @@
 {
+  "crop_yield_stability_ui": {
+    "name": "Crop Yield Stability (UI Scale)",
+    "mean": 37.8456,
+    "std":  19.8428,
+    "min":  0.0,
+    "max":  100.0
+  },
+  "water_reservoir_security_ui": {
+      "name": "Water Reservoir Security (UI Scale)",
+      "mean": 50.0153,
+      "std":  31.7422,
+      "min":  0.0,
+      "max":  100.0
+  },
+  "groundwater_stress_ui": {
+      "name": "Groundwater Stress (UI Scale)",
+      "mean": 50.057,
+      "std":  14.2889,
+      "min":  25.11,
+      "max":  83.0
+  },
+  "agricultural_risk_ui": {
+      "name": "Agricultural Risk Exposure (UI Scale)",
+      "mean": 0.434,
+      "std":  0.5126,
+      "min":  0.0,
+      "max":  1.8895
+  },
+  "groundwater_stress": {
+      "name": "Groundwater Stress",
+      "mean": 0.7458,
+      "std": 0.0747,
+      "min": 0.6632,
+      "max": 0.9119
+  },
+  "agricultural_risk": {
+      "name": "Agricultural Risk Exposure",
+      "mean": 0.0868,
+      "std": 0.1025,
+      "min": 0.0,
+      "max": 0.3779
+  },
+  "regional_resilience": {
+      "name": "Regional Resilience Score",
+      "mean": 74.1096,
+      "std": 8.9601,
+      "min": 49.42,
+      "max": 92.75
+  },
   "groundnut_yield": {
     "name": "Groundnut Yield",
     "mean": 1892.2282,

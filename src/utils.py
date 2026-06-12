@@ -211,9 +211,10 @@ def map_ui_inputs_to_features(sst_anomaly, rainfall_deficit_pct,
     Returns:
         dict of model-ready features
     """
-    # ONI: SST anomaly maps directly
+    heat_multiplier = 1 + (heat_stress - 1) * 0.10 # Heat stress amplifies ONI signal - Scale: each heat level above 1 adds 10% to ONI
     # Historical ONI range in dataset: -1.7 to 2.6
-    oni_djf = sst_anomaly * (2.6 / 3.5)
+    oni_djf = sst_anomaly * (2.6 / 3.5) * heat_multiplier
+    oni_djf = min(oni_djf, 2.6) # cap at historical max
 
     # Rainfall JJAS: apply deficit % to historical mean
     # Historical mean JJAS: 311.1mm
@@ -233,7 +234,8 @@ def map_ui_inputs_to_features(sst_anomaly, rainfall_deficit_pct,
         "rainfall_jjas":         round(rainfall_jjas, 2),
         "rainfall_ond":          round(rainfall_ond, 2),
         "reservoir_storage_pct": round(reservoir_storage_pct, 2),
-        "year":                  year
+        "year":                  year,
+        "groundnut_yield": 1892.23
     }
 
 # 11. POLICY COMPARISON ENGINE
