@@ -1,5 +1,6 @@
 import json
 import numpy as np
+import pandas as pd
 
 # ── 1. LOAD KNOWLEDGE BASE FILES ─────────────────────────────────────────────
 
@@ -53,27 +54,44 @@ def classify_risk(zscore):
 
 # ── 4. GROUNDWATER STRESS PROXY ───────────────────────────────────────────────
 
-def compute_groundwater_stress(reservoir_storage_pct, rainfall_ond, 
-                                 reservoir_mean, rainfall_mean):
+def compute_groundwater_stress(reservoir_storage_pct, 
+                               rainfall_ond, 
+                               rainfall_jjas,
+                                 reservoir_mean, rainfall_ond_mean, 
+                                 rainfall_jjas_mean):
     """
     Derived proxy for groundwater stress.
     Lower reservoir storage + lower rainfall = higher stress.
+    Uses both OND and JJAS rainfall for Tamil Nadu
     Returns a value between 0 (no stress) and 1 (maximum stress).
+    Source: Nair et al. 2021 (GRL); PMC rainfall-groundwater study
     """
     reservoir_norm = np.clip(reservoir_storage_pct / max(reservoir_mean, 1), 0, 2)
-    rainfall_norm  = np.clip(rainfall_ond / max(rainfall_mean, 1), 0, 2)
+    rainfall_ond_norm  = np.clip(rainfall_ond / max(rainfall_ond_mean, 1), 0, 2)
+    rainfall_jjas_norm  = np.clip(rainfall_jjas / max(rainfall_jjas_mean, 1), 0, 2)
+
+    # OND weighted higher for Tamil Nadu (primary monsoon season)
+    rainfall_norm = (0.6 * rainfall_ond_norm) + (0.4 * rainfall_jjas_norm)
+
     stress = 1 - (0.6 * reservoir_norm + 0.4 * rainfall_norm) / 2
     return round(float(np.clip(stress, 0, 1)), 4)
 
 # ── 5. AGRICULTURAL RISK EXPOSURE ─────────────────────────────────────────────
 
-def compute_agricultural_risk(crop_yield, crop_mean, rainfall_ond, rainfall_mean):
+def compute_agricultural_risk(crop_yield, crop_mean, rainfall_ond, rainfall_jjas, rainfall_ond_mean, rainfall_jjas_mean):
     """
     Composite of crop yield deviation and rainfall deficit severity.
     Returns a value between 0 (no risk) and 1 (maximum risk).
+    Source: FAO ASIS; Tandfonline 2025 agricultural drought mapping
     """
     yield_deviation  = np.clip((crop_mean - crop_yield) / max(crop_mean, 1), 0, 1)
-    rainfall_deficit = np.clip((rainfall_mean - rainfall_ond) / max(rainfall_mean, 1), 0, 1)
+
+    # Combined rainfall deficit — OND weighted higher for Tamil Nadu
+    ond_deficit = np.clip((rainfall_ond_mean - rainfall_ond) / max(rainfall_ond_mean, 1), 0, 1)
+    jjas_deficit = np.clip((rainfall_jjas_mean - rainfall_jjas) / max(rainfall_jjas_mean, 1), 0, 1)
+
+    rainfall_deficit = (0.6 * ond_deficit) + (0.4 * jjas_deficit)
+
     return round(float(0.6 * yield_deviation + 0.4 * rainfall_deficit), 4)
 
 # ── 6. REGIONAL RESILIENCE SCORE ──────────────────────────────────────────────
@@ -125,7 +143,7 @@ def check_out_of_distribution(value, min_val, max_val, label):
 
 # ── 9. FULL SCENARIO EVALUATION ───────────────────────────────────────────────
 
-def evaluate_scenario(crop_pred, water_pred, rainfall_ond, stats, policy_rules):
+def evaluate_scenario(crop_pred, water_pred, rainfall_ond, rainfall_jjas, stats, policy_rules):
     """
     Given model predictions, compute all indicators and return
     a complete scenario result dictionary.
@@ -134,7 +152,8 @@ def evaluate_scenario(crop_pred, water_pred, rainfall_ond, stats, policy_rules):
     crop_std   = stats["crop_yield_stability"]["std"]
     water_mean = stats["water_reservoir_security"]["mean"]
     water_std  = stats["water_reservoir_security"]["std"]
-    rainfall_mean = 445.47  # historical OND mean from dataset
+    rainfall_ond_mean  = stats["rainfall_ond"]["mean"]
+    rainfall_jjas_mean = stats["rainfall_jjas"]["mean"]
 
     # Z-scores
     crop_z  = calculate_zscore(crop_pred,  crop_mean,  crop_std)
@@ -146,10 +165,10 @@ def evaluate_scenario(crop_pred, water_pred, rainfall_ond, stats, policy_rules):
 
     # Derived indicators
     groundwater_stress = compute_groundwater_stress(
-        water_pred, rainfall_ond, water_mean, rainfall_mean
+        water_pred, rainfall_ond, rainfall_jjas, water_mean, rainfall_ond_mean, rainfall_jjas_mean
     )
     agricultural_risk = compute_agricultural_risk(
-        crop_pred, crop_mean, rainfall_ond, rainfall_mean
+        crop_pred, crop_mean, rainfall_ond, rainfall_jjas, rainfall_ond_mean, rainfall_jjas_mean
     )
     resilience_score = compute_resilience_score(
         crop_pred, water_pred, agricultural_risk, crop_mean, water_mean
@@ -216,3 +235,140 @@ def map_ui_inputs_to_features(sst_anomaly, rainfall_deficit_pct,
         "reservoir_storage_pct": round(reservoir_storage_pct, 2),
         "year":                  year
     }
+
+# 11. POLICY COMPARISON ENGINE
+
+def evaluate_all_policies(climate_inputs, crop_model, water_model, stats, policy_rules, top_n=3):
+    """
+    Evaluates all 16 binary policy combinations and returns
+    the top N combinations ranked by Regional Resilience Score.
+
+    Policy flags (all binary 0/1):
+        drought_resistant_crops : Short-cycle drought-resistant crop program
+        groundwater_rationing   : Emergency groundwater rationing
+        supplemental_irrigation : Supplemental irrigation support
+        water_conservation      : Water conservation initiative
+    
+    Parameters:
+        climate_inputs : dict of preprocessed model features
+        crop_model     : trained RandomForest crop model
+        water_model    : trained RandomForest water model
+        stats          : historical_statistics.json contents
+        policy_rules   : policy_rules.json contents
+        top_n          : number of top combinations to return
+
+    Returns:
+        list of dicts, sorted by resilience score descending
+    """ 
+    import itertools
+
+    policy_names = [
+        "drought_resistant_crops",
+        "groundwater_rationing",
+        "supplemental_irrigation",
+        "water_conservation"
+    ]
+
+    results = []
+
+    thresholds = load_thresholds()
+
+    # Generate all 16 binary combinations
+    for combo in itertools.product([0, 1], repeat=4):
+        policy_flags = dict(zip(policy_names, combo))
+
+        # Build feature vector with policy flags
+        # Policy flags act as additive adjustments to climate inputs
+        adjusted_inputs = climate_inputs.copy()
+
+        # 8% yield improvement from drought tolerant varieties
+        # Source: Economic Impact of Drought Tolerant Rice Varieties in South India
+        # ResearchGate, 2015 — Tamil Nadu specific field study
+        if policy_flags["drought_resistant_crops"]:
+            adjusted_inputs["rainfall_jjas"] = min(
+                adjusted_inputs["rainfall_jjas"] * 1.08,
+                thresholds["out_of_distribution_bounds"]["rainfall_jjas"]["max"]
+            )
+            adjusted_inputs["rainfall_ond"] = min(
+                adjusted_inputs["rainfall_ond"] * 1.08,
+                thresholds["out_of_distribution_bounds"]["rainfall_ond"]["max"]
+            )
+            # Drought resistant crops also improve overall agricultural conditions, directly boosting the correlated groundnut yield feature
+            groundnut_mean = stats["groundnut_yield"]["mean"]
+            adjusted_inputs["groundnut_yield"] = min(
+                adjusted_inputs.get("groundnut_yield", groundnut_mean) * 1.15,
+                stats["groundnut_yield"]["max"]
+            )
+        
+        # 15% effective water availability improvement from supplemental irrigation
+        # Conservative estimate based on FAO Crop Yield Response to Water (FAO, 2012)
+        # Full irrigation yields 76% more than rainfed (FAO 2025); supplemental effect modeled conservatively
+        if policy_flags["supplemental_irrigation"]:
+            adjusted_inputs["reservoir_storage_pct"] = min(
+                adjusted_inputs["reservoir_storage_pct"] * 1.15,
+                100.0
+            )
+
+        # 10% reservoir retention improvement from water conservation measures
+        # Conservative estimate; drip/micro-irrigation can improve efficiency up to 70%
+        # Source: Drishti IAS citing Maharashtra drip irrigation mandate
+        # 10% reflects policy-level partial adoption, not full system conversion
+        if policy_flags["water_conservation"]:
+            adjusted_inputs["reservoir_storage_pct"] = min(
+                adjusted_inputs["reservoir_storage_pct"] * 1.10,
+                100.0
+            )
+        # 5% reservoir storage benefit from reduced groundwater extraction pressure
+        # Rationing reduces demand on surface water reserves during drought periods
+        # Source: NDMA Drought Management Manual (2020) — groundwater rationing directives
+        if policy_flags["groundwater_rationing"]:
+            adjusted_inputs["reservoir_storage_pct"] = min(
+                adjusted_inputs["reservoir_storage_pct"] * 1.05,
+                100.0
+            )
+        
+        # Model input array
+        feature_order = [
+            "oni_djf",
+            "rainfall_jjas",
+            "rainfall_ond",
+            "reservoir_storage_pct",
+            "year",
+            "groundnut_yield"
+        ]
+
+        # groundnut_yield not adjusted by policy - using historical mean
+        adjusted_inputs.setdefault("groundnut_yield", load_historical_stats()["groundnut_yield"]["mean"])
+
+        X = pd.DataFrame([{k: adjusted_inputs[k] for k in feature_order}])
+
+        # Predict
+        crop_pred = crop_model.predict(X)[0]
+        water_pred = water_model.predict(X)[0]
+
+        # Evaluate full scenario
+        scenario = evaluate_scenario(
+            crop_pred=crop_pred,
+            water_pred=water_pred,
+            rainfall_ond=adjusted_inputs["rainfall_ond"],
+            rainfall_jjas=adjusted_inputs["rainfall_jjas"],
+            stats=stats,
+            policy_rules=policy_rules
+        )
+
+        results.append({
+            "policy_flags": policy_flags,
+            "active_policies": [k for k, v in policy_flags.items() if v == 1],
+            "crop_yield_stability": scenario["crop_yield_stability"],
+            "water_reservoir_security": scenario["water_reservoir_security"],
+            "groundwater_stress": scenario["groundwater_stress"],
+            "agricultural_risk": scenario["agricultural_risk_exposure"],
+            "resilience_score": scenario["regional_resilience_score"],
+            "overall_risk": scenario["overall_risk_category"],
+            "recommendations": scenario["recommendations"]
+        })
+
+    # Sort by resilience score descending
+    results.sort(key=lambda x: x["resilience_score"], reverse=True)
+
+    return results[:top_n]

@@ -1,4 +1,32 @@
 {
+  "groundnut_yield": {
+    "name": "Groundnut Yield",
+    "mean": 1892.2282,
+    "std": 450.7327,
+    "min": 1366.455,
+    "max": 3053.4733
+  },
+  "rice_yield": {
+    "name": "Rice Yield",
+    "mean": 3440.2547,
+    "std": 490.8790,
+    "min": 2690.1092,
+    "max": 4663.3683
+  },
+  "rainfall_ond": {
+    "name": "OND Rainfall",
+    "mean": 445.47,
+    "std": 170.23,
+    "min": 149.3,
+    "max": 782.3
+  },
+  "rainfall_jjas": {
+      "name": "JJAS Rainfall",
+      "mean": 311.15,
+      "std": 86.79,
+      "min": 94.2,
+      "max": 434.3
+  },
   "crop_yield_stability": {
     "name": "Crop Yield Stability",
     "mean": 3436.9024,
