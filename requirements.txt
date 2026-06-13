@@ -1,7 +1,14 @@
 # Runtime dependencies — AI Climate Resilience Sandbox
 # Install:  pip install -r requirements.txt
-streamlit==1.58.0
-plotly==6.8.0
-pandas==3.0.3
-numpy==2.4.6
-fpdf2==2.8.7
+# Run:      streamlit run frontend/app.py   (from the repo root)
+#
+# Pinned to compatible majors for reproducible Streamlit Community Cloud /
+# Hugging Face Spaces deploys. scikit-learn + joblib are required only for Live
+# mode (the trained surrogate models); the app degrades to stub mode without them.
+streamlit>=1.32
+plotly>=5.18
+pandas>=2.0
+numpy>=1.26
+fpdf2>=2.7
+scikit-learn>=1.4
+joblib>=1.3
