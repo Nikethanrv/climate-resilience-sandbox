@@ -1,0 +1,14 @@
+# Streamlit deployment config — AI Climate Resilience Sandbox
+# Read from the repo root on Streamlit Community Cloud / Hugging Face Spaces.
+
+[theme]
+primaryColor = "#1a6b6b"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f0fdfa"
+textColor = "#1f2937"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false

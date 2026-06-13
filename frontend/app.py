@@ -1,13 +1,34 @@
 """
-AI Climate Resilience Sandbox — Frontend Phase 3
+AI Climate Resilience Sandbox — Streamlit frontend (Phases 2–4, production)
 
-This module is the Streamlit UI for the sandbox. Phase 3 wires the existing,
+This module is the Streamlit UI for the sandbox. It consumes the existing,
 already-built backend (``src/utils.py`` decision-support engine, the trained
-``models/*.joblib`` surrogates, and the ``data/*.json`` knowledge base) to the
-Phase 2 dashboard. NO backend logic is reimplemented here — every live capability
-is consumed exclusively through the backend adapter (``get_backend()``), and every
-live-path failure degrades gracefully to a local stub with a visible, non-blocking
-notice. The app must never traceback on a missing or broken teammate module.
+``models/*.joblib`` surrogates, and the ``data/*.json`` knowledge base). NO
+backend logic is reimplemented here — every live capability is consumed
+exclusively through the backend adapter (``get_backend()``), and every live-path
+failure degrades gracefully to a local stub with a visible, non-blocking notice.
+The app must never traceback on a missing or broken teammate module.
+
+ARCHITECTURE
+  main() is the sole orchestrator: it builds the adapter, reads sidebar inputs,
+  runs the (cached) emulator + policy comparison, then calls render_*() helpers.
+  All st.* calls live inside render_*()/main(); no loose top-level UI code.
+
+ADAPTER CONTRACTS (resolved live → degraded to stub, all optional)
+  src.utils         : calculate_zscore, load_policy_rules, load_thresholds,
+                      map_ui_inputs_to_features, evaluate_all_policies
+  policy_engine     : compare_policies(scenario) -> ranked list        (optional)
+  report_generator  : build_report_payload(scenario, results, top_strategy)
+                      -> {"scenario","indicators","recommendation","warnings"} (optional)
+  models/*.joblib   : crop_model + water_model RandomForest surrogates
+                      (features: oni_djf, rainfall_jjas, rainfall_ond,
+                      reservoir_storage_pct, year, groundnut_yield)
+  data/*.json       : historical_statistics.json, policy_rules.json,
+                      risk_threshold.json
+
+RUN
+  pip install -r requirements.txt
+  streamlit run frontend/app.py        # from the repo root (Community Cloud: main file = frontend/app.py)
 
 PHASE 2 FIXES (retained):
   FIX-1  RISK_* thresholds are module constants — never inline literals.
@@ -37,6 +58,20 @@ PHASE 3 WIRING (this revision):
         engine exposes them. (Step 3.7)
   P3-5  perf_counter instrumentation, slow-response caption, cached hot path,
         a hidden Dev/QA panel, and the Step 3.12 manual-QA checklist.
+
+PHASE 4 (deploy readiness):
+  P4-1  Export pipeline: one report payload (report_generator.build_report_payload
+        via the adapter, else an identical-shaped local builder) feeds three pure
+        serializers (TXT/PDF/CSV). No serializer reads session_state. Timestamped
+        filenames, latin-1-sanitized PDF that degrades gracefully without fpdf2,
+        UTF-8-BOM CSV, and a "Report preview" expander. (Step 4.3)
+  P4-2  Mobile/compact final pass: extended @media(max-width:768px) rules, a
+        "📱 Compact mode" sidebar toggle that reflows map/recs/radar, and a single
+        Plotly config {displayModeBar:False, scrollZoom:False} on all charts. (4.4)
+  P4-3  Low-bandwidth: system-ui font stack (no runtime CDN), caching on the
+        backend/emulator/fallback/stats/report payload, timings in Dev/QA. (4.5)
+  P4-4  Deployment: pinned-major requirements.txt, .streamlit/config.toml, a global
+        try/except guard around main(), and the Step 4.9 release checklist.
 """
 
 # ── Stdlib imports ────────────────────────────────────────────────────────────
@@ -103,6 +138,23 @@ OOD_WARNING_TEXT = (
 # P3-5: a full rerun slower than this (seconds) surfaces a caching notice.
 SLOW_RESPONSE_SECS = 1.5
 
+# ── Phase 4: charts, layout, exports ─────────────────────────────────────────
+# P4-2: one mobile-safe Plotly config reused by every chart.
+PLOTLY_CONFIG: dict = {"displayModeBar": False, "scrollZoom": False, "displaylogo": False}
+# Chart heights: full layout vs. Compact mode.
+MAP_HEIGHT, MAP_HEIGHT_COMPACT     = 420, 320
+RADAR_HEIGHT, RADAR_HEIGHT_COMPACT = 380, 300
+# P4-1: the canonical report-payload shape (one payload → three serializers).
+REPORT_PAYLOAD_KEYS = {"scenario", "indicators", "recommendation", "warnings"}
+# Indicators rendered in every report (result_key, display name, unit, status fn name).
+REPORT_INDICATOR_SPECS = (
+    ("crop_yield_stability",     "Crop Yield Stability",       "%",     "_status_higher_better"),
+    ("water_reservoir_security", "Water Reservoir Security",   "%",     "_status_higher_better"),
+    ("groundwater_stress",       "Groundwater Stress",         "%",     "_status_gw_stress"),
+    ("agricultural_risk",        "Agricultural Risk Exposure", "/ 5.0", "_status_ag_risk"),
+    ("regional_resilience",      "Regional Resilience Score",  "%",     "_status_higher_better"),
+)
+
 # Fallback stats — used when historical_statistics.json is absent or partial.
 # Keyed to match the *_ui scales the emulator outputs so the Z-score panel and
 # metric cards stay meaningful even in stub mode.
@@ -141,6 +193,7 @@ SESSION_DEFAULTS: dict = {
     "adapt_irrigation":  False,
     "adapt_water":       False,
     "active_preset":     "custom",
+    "compact_mode":      False,
 }
 
 # Frontend adaptation keys and their display names.
@@ -464,6 +517,8 @@ def get_backend() -> dict:
       map_inputs      — (sst, rainfall, drought, heat, reservoir, [year]) -> dict
       compare         — (scenario) -> normalized ranked list
       compare_is_live — bool (True only when backed by a real engine)
+      build_payload   — (scenario, results, top_strategy) -> report payload dict
+      payload_is_live — bool (True only when report_generator is present)
       detail          — human-readable wiring notes for the Dev/QA panel
     """
     backend: dict = {
@@ -475,6 +530,8 @@ def get_backend() -> dict:
         "map_inputs":      stub_map_inputs,
         "compare":         None,           # set below (fallback by default)
         "compare_is_live": False,
+        "build_payload":   None,           # set below (local builder by default)
+        "payload_is_live": False,
         "detail":          {},
     }
     detail = backend["detail"]
@@ -591,6 +648,32 @@ def get_backend() -> dict:
         )
         backend["compare_is_live"] = False
         detail.setdefault("compare", "local 16-combo fallback")
+
+    # ── Teammate 1: report generator (Step 4.3) ──────────────────────────────
+    # Prefer report_generator.build_report_payload; otherwise an identical-shaped
+    # local builder. The live wrapper validates the payload shape and silently
+    # degrades to the local builder on any failure.
+    try:
+        from report_generator import build_report_payload as _brp  # noqa: PLC0415
+
+        def _live_build(scenario: dict, results: dict, top_strategy: dict) -> dict:
+            try:
+                payload = _brp(scenario, results, top_strategy)
+                if _validate_payload(payload):
+                    return payload
+                logging.warning("report_generator payload shape invalid — local builder")
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("report_generator failed — local builder: %s", exc)
+            return _local_build_payload(scenario, results, top_strategy)
+
+        backend["build_payload"] = _live_build
+        backend["payload_is_live"] = True
+        detail["report"] = "live (report_generator.build_report_payload)"
+        logging.info("report_generator wired as live report payload builder")
+    except Exception:  # noqa: BLE001 — module simply not present in this build
+        backend["build_payload"] = _local_build_payload
+        backend["payload_is_live"] = False
+        detail.setdefault("report", "local payload builder")
 
     return backend
 
@@ -716,103 +799,202 @@ def _directive_cell_style(val: str) -> str:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# REPORT GENERATORS
+# REPORT PIPELINE  (P4-1: one payload → three pure serializers)
 # ═════════════════════════════════════════════════════════════════════════════
+#
+# Contract (shared with report_generator.build_report_payload):
+#   build(scenario, results, top_strategy) -> {
+#       "scenario":       {sst, rainfall, drought, heat, active_adaptations, timestamp},
+#       "indicators":     [{name, value, unit, status}, ...],
+#       "recommendation": {strategies, score},
+#       "warnings":       [str, ...],
+#   }
+# No serializer reads st.session_state — everything comes from the payload.
 
-def generate_txt_report(
-    scenario: dict,
-    results: dict,
-    top_strategy: dict,
-    warnings: list,
-) -> str:
-    """Generate the plain-text action briefing. ``warnings`` is the OOD list."""
+REPORT_DISCLAIMER = (
+    "This briefing is generated by an AI surrogate model for scenario planning "
+    "purposes only. It does not constitute an operational forecast or official "
+    "government guidance."
+)
+
+
+def _validate_payload(payload) -> bool:
+    """True if ``payload`` matches the canonical report shape."""
+    return (
+        isinstance(payload, dict)
+        and REPORT_PAYLOAD_KEYS <= set(payload)
+        and isinstance(payload.get("indicators"), list)
+        and isinstance(payload.get("warnings"), list)
+        and isinstance(payload.get("scenario"), dict)
+        and isinstance(payload.get("recommendation"), dict)
+    )
+
+
+def _local_build_payload(scenario: dict, results: dict, top_strategy: dict) -> dict:
+    """Local fallback for report_generator.build_report_payload (identical shape).
+
+    Self-contained: derives indicator status labels from the status-pill helpers
+    and warnings from the single get_ood_warnings() source. Reads no session_state.
+    """
     from datetime import datetime
 
-    active = [k for k, v in scenario["adapt_dict"].items() if v] or ["None selected"]
-    if warnings:
-        warning_block = "\n".join("⚠️  " + w for w in warnings)
-    else:
-        warning_block = "✅  Scenario within historical training range (1991–2017)."
+    status_fns = {
+        "_status_higher_better": _status_higher_better,
+        "_status_gw_stress":     _status_gw_stress,
+        "_status_ag_risk":       _status_ag_risk,
+    }
+    indicators = []
+    for result_key, name, unit, fn_name in REPORT_INDICATOR_SPECS:
+        value = results[result_key]
+        status_label, _color = status_fns[fn_name](value)
+        indicators.append({"name": name, "value": value, "unit": unit, "status": status_label})
 
+    active = [STRATEGY_NAMES[k] for k in ORDERED_KEYS if scenario["adapt_dict"].get(k)]
+    warnings = get_ood_warnings(
+        scenario["sst"], scenario["rainfall"], scenario["drought"], scenario["heat"],
+        load_historical_stats(),
+    )
+    return {
+        "scenario": {
+            "sst":      scenario["sst"],
+            "rainfall": scenario["rainfall"],
+            "drought":  scenario["drought"],
+            "heat":     scenario["heat"],
+            "active_adaptations": active,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M UTC"),
+        },
+        "indicators":     indicators,
+        "recommendation": {"strategies": list(top_strategy["strategies"]), "score": top_strategy["score"]},
+        "warnings":       list(warnings),
+    }
+
+
+def report_filename(ext: str) -> str:
+    """Timestamped download filename: resilience_briefing_{YYYYMMDD_HHMM}.{ext}."""
+    from datetime import datetime
+    return f"resilience_briefing_{datetime.now().strftime('%Y%m%d_%H%M')}.{ext}"
+
+
+def fpdf_available() -> bool:
+    """True if fpdf2 is importable (PDF export is otherwise hidden)."""
+    import importlib.util
+    return importlib.util.find_spec("fpdf") is not None
+
+
+def _latin1(text) -> str:
+    """Sanitize a string to latin-1 for fpdf2 core fonts (strip emoji, ✓ -> [x])."""
+    s = str(text)
+    for bad, good in (("✓", "[x]"), ("✅", "[x]"), ("⚠️", "[!]"), ("•", "-"),
+                      ("–", "-"), ("—", "-"), ("…", "...")):
+        s = s.replace(bad, good)
+    return s.encode("latin-1", "ignore").decode("latin-1")
+
+
+def payload_to_txt(payload: dict) -> str:
+    """Serialize the payload to the plain-text action briefing."""
+    s, ind = payload["scenario"], payload["indicators"]
+    rec, warns = payload["recommendation"], payload["warnings"]
+
+    active = s["active_adaptations"] or ["None selected"]
+    ind_lines = "\n".join(
+        f"{i['name']:<28}: {i['value']}{i['unit']}  [{i['status']}]" for i in ind
+    )
+    warning_block = (
+        "\n".join("WARNING: " + w for w in warns) if warns
+        else "Scenario within historical training range (1991-2017)."
+    )
     return f"""
-═══════════════════════════════════════════════════
-AI CLIMATE RESILIENCE SANDBOX — ACTION BRIEFING
-Generated: {datetime.now().strftime("%Y-%m-%d %H:%M UTC")}
-═══════════════════════════════════════════════════
+===================================================
+AI CLIMATE RESILIENCE SANDBOX - ACTION BRIEFING
+Generated: {s["timestamp"]}
+===================================================
 
 SCENARIO PARAMETERS
-───────────────────
-Sea Surface Temperature Anomaly : {scenario["sst"]}°C
-Monsoon Rainfall Deficit        : {scenario["rainfall"]}%
-Drought Duration                : {scenario["drought"]} months
-Heat Stress Index               : {scenario["heat"]} / 5
+-------------------
+Sea Surface Temperature Anomaly : {s["sst"]} C
+Monsoon Rainfall Deficit        : {s["rainfall"]} %
+Drought Duration                : {s["drought"]} months
+Heat Stress Index               : {s["heat"]} / 5
 
 ADAPTATION MEASURES ACTIVE
-──────────────────────────
-{chr(10).join("  ✓ " + a for a in active)}
+--------------------------
+{chr(10).join("  - " + a for a in active)}
 
 KEY RISK INDICATORS
-───────────────────
-Crop Yield Stability       : {results["crop_yield_stability"]}%
-Water Reservoir Security   : {results["water_reservoir_security"]}%
-Groundwater Stress         : {results["groundwater_stress"]}%
-Agricultural Risk Exposure : {results["agricultural_risk"]} / 5.0
-Regional Resilience Score  : {results["regional_resilience"]}%
+-------------------
+{ind_lines}
 
 TOP RECOMMENDED STRATEGY
-─────────────────────────
-Strategies : {", ".join(top_strategy["strategies"]) or "None"}
-Projected Resilience : {top_strategy["score"]}%
+------------------------
+Strategies          : {", ".join(rec["strategies"]) or "None"}
+Projected Resilience : {rec["score"]}%
 
 WARNINGS
-────────
+--------
 {warning_block}
-Model: Random Forest Regressor | Training period: 1991–2017
+Model: Random Forest Regressor | Training period: 1991-2017
 
-───────────────────────────────────────────────────
+---------------------------------------------------
 DISCLAIMER
-This briefing is generated by an AI surrogate model for
-scenario planning purposes only. It does not constitute
-an operational forecast or official government guidance.
-═══════════════════════════════════════════════════
+{REPORT_DISCLAIMER}
+===================================================
 """
 
 
-def generate_pdf_report(
-    scenario: dict,
-    results: dict,
-    top_strategy: dict,
-    warnings: list,
-) -> bytes:
-    """Generate the PDF action briefing. ``warnings`` is the OOD list. Returns bytes."""
-    from datetime import datetime
+def payload_to_csv(payload: dict) -> bytes:
+    """Serialize the payload to a single-row CSV (UTF-8 BOM for Excel/Sheets)."""
+    s, rec = payload["scenario"], payload["recommendation"]
+    row = {
+        "SST_Anomaly_C":        s["sst"],
+        "Rainfall_Deficit_pct": s["rainfall"],
+        "Drought_Months":       s["drought"],
+        "Heat_Stress":          s["heat"],
+        "Active_Adaptations":   "; ".join(s["active_adaptations"]) or "None",
+    }
+    for i in payload["indicators"]:
+        col = i["name"].replace(" ", "_")
+        row[col] = i["value"]
+        row[f"{col}_Status"] = i["status"]
+    row["Top_Strategy"] = ", ".join(rec["strategies"]) or "None"
+    row["Projected_Resilience_pct"] = rec["score"]
+    row["Warnings"] = "; ".join(payload["warnings"]) or "None"
+    # UTF-8 BOM so non-ASCII opens cleanly in Excel; index=False for a clean sheet.
+    return pd.DataFrame([row]).to_csv(index=False).encode("utf-8-sig")
+
+
+def payload_to_pdf(payload: dict) -> bytes:
+    """Serialize the payload to the PDF action briefing (latin-1 sanitized)."""
     from fpdf import FPDF
+
+    s, ind = payload["scenario"], payload["indicators"]
+    rec, warns = payload["recommendation"], payload["warnings"]
 
     pdf = FPDF()
     pdf.add_page()
 
+    # Teal header band.
     pdf.set_fill_color(26, 107, 107)
     pdf.rect(0, 0, 210, 22, "F")
     pdf.set_font("Helvetica", "B", 14)
     pdf.set_text_color(255, 255, 255)
     pdf.set_xy(10, 6)
-    pdf.cell(0, 10, "AI Climate Resilience Sandbox - Action Briefing")
-
+    pdf.cell(0, 10, _latin1("AI Climate Resilience Sandbox - Action Briefing"))
     pdf.set_font("Helvetica", "", 9)
     pdf.set_text_color(200, 240, 240)
     pdf.set_xy(10, 15)
-    pdf.cell(0, 6, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}")
+    pdf.cell(0, 6, _latin1(f"Generated: {s['timestamp']}"))
 
     pdf.set_text_color(30, 30, 30)
     pdf.set_y(28)
 
-    if warnings:
+    # Red warning box.
+    if warns:
         pdf.set_fill_color(254, 226, 226)
         pdf.set_draw_color(220, 38, 38)
         pdf.set_font("Helvetica", "B", 9)
         pdf.set_text_color(153, 27, 27)
-        for w in warnings:
-            pdf.multi_cell(0, 7, w, border=1, fill=True)
+        for w in warns:
+            pdf.multi_cell(0, 7, _latin1(w), border=1, fill=True)
         pdf.set_text_color(30, 30, 30)
         pdf.ln(3)
 
@@ -820,62 +1002,70 @@ def generate_pdf_report(
         pdf.set_font("Helvetica", "B", 11)
         pdf.set_fill_color(240, 253, 250)
         pdf.set_text_color(26, 107, 107)
-        pdf.cell(0, 8, title, new_x="LMARGIN", new_y="NEXT", fill=True)
+        pdf.cell(0, 8, _latin1(title), new_x="LMARGIN", new_y="NEXT", fill=True)
         pdf.set_text_color(30, 30, 30)
         pdf.set_font("Helvetica", "", 10)
         pdf.ln(1)
 
-    def row(label: str, value, unit: str = "") -> None:
+    def row(label: str, value) -> None:
         pdf.set_font("Helvetica", "", 10)
-        pdf.cell(90, 7, label)
+        pdf.cell(95, 7, _latin1(label))
         pdf.set_font("Helvetica", "B", 10)
-        pdf.cell(0, 7, f"{value}{unit}", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 7, _latin1(value), new_x="LMARGIN", new_y="NEXT")
 
     section("SCENARIO PARAMETERS")
-    row("SST Anomaly",       scenario["sst"],      " C")
-    row("Rainfall Deficit",  scenario["rainfall"], "%")
-    row("Drought Duration",  scenario["drought"],  " months")
-    row("Heat Stress Index", scenario["heat"],     " / 5")
+    row("SST Anomaly",       f"{s['sst']} C")
+    row("Rainfall Deficit",  f"{s['rainfall']} %")
+    row("Drought Duration",  f"{s['drought']} months")
+    row("Heat Stress Index", f"{s['heat']} / 5")
     pdf.ln(3)
 
     section("ADAPTATION MEASURES ACTIVE")
-    active = [k for k, v in scenario["adapt_dict"].items() if v]
-    names = {
-        "crops": "Drought-Resistant Crop Program",
-        "gw":    "Emergency Groundwater Rationing",
-        "irr":   "Supplemental Irrigation Support",
-        "water": "Water Conservation Initiative",
-    }
+    active = s["active_adaptations"]
     if active:
-        for k in active:
-            pdf.cell(0, 7, f"  -  {names[k]}", new_x="LMARGIN", new_y="NEXT")
+        for a in active:
+            pdf.cell(0, 7, _latin1(f"  -  {a}"), new_x="LMARGIN", new_y="NEXT")
     else:
-        pdf.cell(0, 7, "  No measures active", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 7, _latin1("  No measures active"), new_x="LMARGIN", new_y="NEXT")
     pdf.ln(3)
 
     section("KEY RISK INDICATORS")
-    row("Crop Yield Stability",       results["crop_yield_stability"],     "%")
-    row("Water Reservoir Security",   results["water_reservoir_security"], "%")
-    row("Groundwater Stress",         results["groundwater_stress"],       "%")
-    row("Agricultural Risk Exposure", results["agricultural_risk"],        " / 5.0")
-    row("Regional Resilience Score",  results["regional_resilience"],      "%")
+    for i in ind:
+        row(i["name"], f"{i['value']}{i['unit']}  [{i['status']}]")
     pdf.ln(3)
 
     section("TOP RECOMMENDED STRATEGY")
-    strats = ", ".join(top_strategy["strategies"]) or "None"
-    pdf.multi_cell(0, 7, f"Strategies: {strats}")
-    row("Projected Resilience", top_strategy["score"], "%")
+    pdf.multi_cell(0, 7, _latin1("Strategies: " + (", ".join(rec["strategies"]) or "None")))
+    row("Projected Resilience", f"{rec['score']}%")
     pdf.ln(3)
 
     pdf.set_font("Helvetica", "I", 8)
     pdf.set_text_color(120, 120, 120)
-    pdf.multi_cell(
-        0, 5,
-        "DISCLAIMER: This briefing is generated by an AI surrogate model "
-        "for scenario planning purposes only. It does not constitute an "
-        "operational forecast or official government guidance.",
-    )
+    pdf.multi_cell(0, 5, _latin1("DISCLAIMER: " + REPORT_DISCLAIMER))
     return bytes(pdf.output())
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def build_payload_cached(
+    sst: float, rainfall: float, drought: float, heat: float,
+    crops: int, gw: int, irr: int, water: int,
+    strategies: tuple, score: float,
+) -> dict:
+    """Cached report payload (P4-3), keyed on inputs + the chosen top strategy.
+
+    Routes through backend["build_payload"] (live report_generator or the local
+    builder) so all three serializers consume one identical payload.
+    """
+    backend = get_backend()
+    results = _emulate_cached(sst, rainfall, drought, heat, crops, gw, irr, water)
+    scenario = {
+        "sst": sst, "rainfall": rainfall, "drought": drought, "heat": heat,
+        "adapt_dict": {"crops": crops, "gw": gw, "irr": irr, "water": water},
+    }
+    top_strategy = {"strategies": list(strategies), "score": score}
+    payload = backend["build_payload"](scenario, results, top_strategy)
+    # Defensive: a live builder returning a bad shape degrades to local.
+    return payload if _validate_payload(payload) else _local_build_payload(scenario, results, top_strategy)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -978,13 +1168,25 @@ def _inject_css() -> None:
         #MainMenu {visibility: hidden;}
         footer {visibility: hidden;}
         header[data-testid="stHeader"] {background: transparent;}
-        html, body, [class*="css"] { font-size: 1rem; }
+        /* P4-3: system-ui first — no runtime web-font CDN required. */
+        html, body, [class*="css"] {
+            font-size: 1rem;
+            font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        }
+        /* P4-2: mobile final pass — stacked layout, full-width buttons, hidden legend. */
         @media (max-width: 768px) {
             [data-testid="column"] { min-width: 100% !important; margin-bottom: 0.5rem; }
             h1 { font-size: 1.3rem !important; }
             h2 { font-size: 1.1rem !important; }
             .crs-card { padding: 10px !important; }
+            .crs-disclaimer { padding: 0.5rem 0.9rem !important; }
+            .map-legend { display: none !important; }
             .stDownloadButton > button { width: 100% !important; }
+            /* Tap targets >= 40px and preset buttons wrap one-per-row if needed. */
+            .stButton > button, .stDownloadButton > button { min-height: 40px !important; }
+            section[data-testid="stSidebar"] div[data-testid="column"] {
+                min-width: 100% !important;
+            }
         }
         </style>
         """,
@@ -1131,6 +1333,13 @@ def render_sidebar(backend: dict) -> tuple:
 
         st.button("↺ Reset to Default", use_container_width=True, on_click=_reset_defaults)
 
+        st.markdown("---")
+        st.checkbox(
+            "📱 Compact mode", key="compact_mode",
+            help="Stacks the map, recommendations and radar full-width and shrinks "
+                 "charts — better for phones and low-bandwidth connections.",
+        )
+
         with st.expander("ℹ️ About this tool"):
             st.markdown(
                 """
@@ -1273,7 +1482,7 @@ def render_metric_cards(results: dict, baseline: dict) -> None:
                 )
 
 
-def render_risk_map(adj: float) -> None:
+def render_risk_map(adj: float, height: int = MAP_HEIGHT) -> None:
     """Render the interactive district risk map (or treemap fallback)."""
     st.subheader("📍 Regional Risk Distribution")
 
@@ -1334,7 +1543,7 @@ def render_risk_map(adj: float) -> None:
             },
             zoom=6,
             center={"lat": 10.5, "lon": 78.5},
-            height=420,
+            height=height,
         )
         fig_map.update_layout(
             map_style="carto-positron",
@@ -1342,9 +1551,7 @@ def render_risk_map(adj: float) -> None:
             legend_title_text="Risk Level",
         )
         st.plotly_chart(
-            fig_map, use_container_width=True,
-            config={"scrollZoom": True, "displayModeBar": False, "displaylogo": False},
-            key="risk_map",
+            fig_map, use_container_width=True, config=PLOTLY_CONFIG, key="risk_map",
         )
     except Exception:  # noqa: BLE001
         fig_tree = px.treemap(
@@ -1352,18 +1559,18 @@ def render_risk_map(adj: float) -> None:
             color="Resilience Score (%)",
             color_continuous_scale=["#dc2626", "#ca8a04", "#16a34a"],
             hover_data={"Risk Level": True, "Resilience Score (%)": True},
-            height=420,
+            height=height,
         )
         fig_tree.update_layout(margin={"l": 0, "r": 0, "t": 0, "b": 0})
         st.plotly_chart(
-            fig_tree, use_container_width=True,
-            config={"displayModeBar": False, "displaylogo": False},
-            key="risk_map",
+            fig_tree, use_container_width=True, config=PLOTLY_CONFIG, key="risk_map",
         )
 
+    # .map-legend is hidden on phones via the @media block (P4-2).
     st.markdown(
-        "🟢 Normal&nbsp;&nbsp; 🟡 Elevated Risk&nbsp;&nbsp; "
-        "🟠 Severe Stress&nbsp;&nbsp; 🔴 Critical Alert"
+        "<div class='map-legend'>🟢 Normal&nbsp;&nbsp; 🟡 Elevated Risk&nbsp;&nbsp; "
+        "🟠 Severe Stress&nbsp;&nbsp; 🔴 Critical Alert</div>",
+        unsafe_allow_html=True,
     )
 
 
@@ -1439,7 +1646,7 @@ def render_recommendations(adapt_dict: dict, all_combos: list) -> None:
         )
 
 
-def render_radar_chart(results: dict, baseline: dict) -> None:
+def render_radar_chart(results: dict, baseline: dict, height: int = RADAR_HEIGHT) -> None:
     """Render the resilience radar chart (with vs. without adaptations)."""
     st.subheader("📈 Resilience Profile — With vs. Without Adaptations")
 
@@ -1482,10 +1689,10 @@ def render_radar_chart(results: dict, baseline: dict) -> None:
             "radialaxis": {"visible": True, "range": [0, 100], "ticksuffix": "%"},
             "angularaxis": {"rotation": 90},
         },
-        showlegend=True, paper_bgcolor="rgba(0,0,0,0)", height=380,
+        showlegend=True, paper_bgcolor="rgba(0,0,0,0)", height=height,
         margin={"l": 40, "r": 40, "t": 40, "b": 40},
     )
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
 
 
 def render_zscore_panel(results: dict, hist_stats: dict, backend: dict, policy_rules: dict) -> None:
@@ -1556,11 +1763,12 @@ def render_zscore_panel(results: dict, hist_stats: dict, backend: dict, policy_r
         )
 
 
-def render_transparency(results: dict, ood_warnings: list, hist_stats: dict) -> None:
+def render_transparency(results: dict, ood_warnings: list, hist_stats: dict,
+                        expanded: bool = False) -> None:
     """Render the transparency & model-confidence expander (Step 3.7)."""
     confidence = results.get("confidence") if isinstance(results.get("confidence"), dict) else None
 
-    with st.expander("🔍 Transparency & Model Confidence", expanded=False):
+    with st.expander("🔍 Transparency & Model Confidence", expanded=expanded):
         t1, t2, t3 = st.columns(3)
 
         with t1:
@@ -1629,50 +1837,57 @@ def render_transparency(results: dict, ood_warnings: list, hist_stats: dict) -> 
             )
 
 
-def render_export(scenario_data: dict, results: dict, all_combos: list, ood_warnings: list) -> None:
-    """Render the export action-briefing section (Step 3.7 warnings parity)."""
+def render_export(scenario_data: dict, all_combos: list) -> None:
+    """Render the export section (P4-1: one payload → TXT/PDF/CSV serializers).
+
+    Content regenerates every rerun (the payload is keyed on the current inputs +
+    top strategy) so every download equals the on-screen scenario.
+    """
     st.divider()
     st.subheader("📄 Export Action Briefing")
 
     top = all_combos[0]
-    top_strategy = {"strategies": top["strategies"], "score": top["score"]}
+    adapt = scenario_data["adapt_dict"]
 
-    txt_content = generate_txt_report(scenario_data, results, top_strategy, ood_warnings)
+    t0 = time.perf_counter()
+    payload = build_payload_cached(
+        scenario_data["sst"], scenario_data["rainfall"],
+        scenario_data["drought"], scenario_data["heat"],
+        adapt["crops"], adapt["gw"], adapt["irr"], adapt["water"],
+        tuple(top["strategies"]), top["score"],
+    )
+    txt_content = payload_to_txt(payload)
+    csv_bytes   = payload_to_csv(payload)
+    # Surface report build time in the Dev/QA panel.
+    st.session_state.setdefault("_timings", {})["report"] = round(time.perf_counter() - t0, 4)
 
-    csv_df = pd.DataFrame([{
-        "SST_Anomaly_C":        scenario_data["sst"],
-        "Rainfall_Deficit_pct": scenario_data["rainfall"],
-        "Drought_Months":       scenario_data["drought"],
-        "Heat_Stress":          scenario_data["heat"],
-        "Crop_Yield_Stability": results["crop_yield_stability"],
-        "Water_Security":       results["water_reservoir_security"],
-        "Groundwater_Stress":   results["groundwater_stress"],
-        "Agricultural_Risk":    results["agricultural_risk"],
-        "Regional_Resilience":  results["regional_resilience"],
-        "OOD_Warning":          "; ".join(ood_warnings) or "None",
-    }])
+    with st.expander("👁 Report preview (TXT)", expanded=False):
+        st.code(txt_content, language="text")
 
     ec1, ec2, ec3 = st.columns(3)
     with ec1:
         st.download_button(
             "⬇ Download TXT Report", data=txt_content,
-            file_name="climate_resilience_briefing.txt", mime="text/plain",
+            file_name=report_filename("txt"), mime="text/plain",
             use_container_width=True,
         )
     with ec2:
-        try:
-            pdf_bytes = generate_pdf_report(scenario_data, results, top_strategy, ood_warnings)
-            st.download_button(
-                "⬇ Download PDF Report", data=pdf_bytes,
-                file_name="climate_resilience_briefing.pdf", mime="application/pdf",
-                use_container_width=True,
-            )
-        except ImportError:
-            st.info("PDF export requires: pip install fpdf2")
+        # PDF depends on fpdf2 only; TXT/CSV never do. Degrade gracefully.
+        if fpdf_available():
+            try:
+                st.download_button(
+                    "⬇ Download PDF Report", data=payload_to_pdf(payload),
+                    file_name=report_filename("pdf"), mime="application/pdf",
+                    use_container_width=True,
+                )
+            except ImportError:
+                st.caption("PDF export unavailable — install fpdf2")
+        else:
+            st.caption("PDF export unavailable — install fpdf2")
     with ec3:
         st.download_button(
-            "⬇ Download CSV Data", data=csv_df.to_csv(index=False),
-            file_name="climate_scenario_data.csv", mime="text/csv",
+            "⬇ Download CSV Data", data=csv_bytes,
+            file_name=report_filename("csv"), mime="text/csv",
             use_container_width=True,
         )
 
@@ -1685,6 +1900,7 @@ def render_dev_panel(backend: dict, timings: dict) -> None:
             st.write({
                 "source":          backend.get("source"),
                 "compare_is_live": backend.get("compare_is_live"),
+                "payload_is_live": backend.get("payload_is_live"),
                 **backend.get("detail", {}),
             })
             st.caption("Last computation")
@@ -1692,6 +1908,7 @@ def render_dev_panel(backend: dict, timings: dict) -> None:
             st.write({
                 "emulator_s": round(timings.get("emulator", 0.0), 4),
                 "compare_s":  round(timings.get("compare", 0.0), 4),
+                "report_s":   timings.get("report", "n/a"),
                 "total_s":    round(total, 4),
                 "compare_used": timings.get("compare_used", "n/a"),
                 "cache":      "likely hit" if total < 0.05 else "fresh compute",
@@ -1774,6 +1991,11 @@ def main() -> None:
     policy_rules = backend["policy_rules"]()
     ood_warnings = get_ood_warnings(sst, rainfall, drought, heat, hist_stats)
 
+    # P4-2: Compact mode reflows the layout and shrinks the charts.
+    compact = bool(st.session_state["compact_mode"])
+    map_height   = MAP_HEIGHT_COMPACT if compact else MAP_HEIGHT
+    radar_height = RADAR_HEIGHT_COMPACT if compact else RADAR_HEIGHT
+
     # ── Main area ─────────────────────────────────────────────────────────────
     render_header()
     render_scenario_summary(sst, rainfall, drought, heat, adapt_dict)
@@ -1782,21 +2004,31 @@ def main() -> None:
     render_status_alerts(adj, policy_rules, ood_warnings)   # above the cards
     render_metric_cards(results, baseline)
 
-    left_col, right_col = st.columns([1.4, 1], gap="large")
-    with left_col:
-        render_risk_map(adj)
-    with right_col:
+    if compact:
+        # Phones / low-bandwidth: map and recommendations stack full-width.
+        render_risk_map(adj, height=map_height)
         render_recommendations(adapt_dict, all_combos)
+    else:
+        left_col, right_col = st.columns([1.4, 1], gap="large")
+        with left_col:
+            render_risk_map(adj, height=map_height)
+        with right_col:
+            render_recommendations(adapt_dict, all_combos)
 
-    render_radar_chart(results, baseline)
+    render_radar_chart(results, baseline, height=radar_height)
     render_zscore_panel(results, hist_stats, backend, policy_rules)
-    render_transparency(results, ood_warnings, hist_stats)
-    render_export(scenario_data, results, all_combos, ood_warnings)
+    render_transparency(results, ood_warnings, hist_stats, expanded=False)
+    render_export(scenario_data, all_combos)
     render_dev_panel(backend, timings)
     render_footer()
 
 
-main()
+# P4-4: production guard — a single friendly message instead of a raw traceback.
+try:
+    main()
+except Exception:  # noqa: BLE001
+    logging.exception("Unhandled error in main()")
+    st.error("Something went wrong — adjust inputs or reload.")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1835,3 +2067,34 @@ main()
 #     local 16-combo loop, and the app stays fully usable with NO traceback. Restore
 #     the file and confirm Live returns. Repeat by renaming src/utils.py (utils
 #     features degrade only) and data/policy_rules.json (guidance text falls back).
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# RELEASE VALIDATION CHECKLIST — Step 4.9 (every item must pass before merge)
+# ═════════════════════════════════════════════════════════════════════════════
+#
+#  [ ] Fresh venv -> pip install -r requirements.txt -> streamlit run frontend/app.py:
+#      zero errors, app loads.
+#  [ ] Stub mode (rename src/utils.py + models/*.joblib): full app usable, badge
+#      shows Stub/Partial, recommendations use the local 16-combo loop.
+#  [ ] Live mode: badge = "Live models"; real predictions drive cards, map, radar,
+#      Z-scores, directive, and recommendations (Dev/QA: compare_is_live=True).
+#  [ ] All 3 presets (Moderate / Severe / Extreme): alert level, map colours,
+#      top-3 ranking, Active Directive band, and OOD state are all correct.
+#  [ ] TXT / PDF / CSV download and exactly match the on-screen values; filenames
+#      are resilience_briefing_{YYYYMMDD_HHMM}.{ext}; "Report preview" matches.
+#  [ ] fpdf2 uninstalled: TXT + CSV still download; PDF button hidden with the
+#      caption "PDF export unavailable — install fpdf2".
+#  [ ] CSV opens cleanly in Excel/Google Sheets (UTF-8 BOM, single labeled row,
+#      no index column).
+#  [ ] 375px viewport: columns stacked, no horizontal scroll anywhere, download
+#      buttons full width, tap targets >= 40px, map legend hidden.
+#  [ ] "Compact mode" toggle reflows map + recommendations sequentially full-width
+#      and shrinks the map (420->320) and radar (380->300).
+#  [ ] Throttled "Slow 3G": first load acceptable (no runtime font CDN; Plotly is
+#      the only heavy asset); warm reruns are near-instant (Dev/QA timings < 1s).
+#  [ ] Disclaimer visible in the header bar AND in every report (TXT/PDF).
+#  [ ] Global guard: forcing an error in main() shows a single friendly st.error,
+#      never a raw traceback.
+#  [ ] requirements.txt (pinned majors) + .streamlit/config.toml committed at the
+#      repo root; deploys cleanly to Streamlit Community Cloud (main = frontend/app.py).
