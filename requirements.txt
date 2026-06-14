@@ -1,6 +1,6 @@
 # Runtime dependencies — AI Climate Resilience Sandbox
 # Install:  pip install -r requirements.txt
-# Run:      streamlit run frontend/app.py   (from the repo root)
+# Run:      streamlit run app.py   (from the repo root)
 #
 # Pinned to compatible majors for reproducible Streamlit Community Cloud /
 # Hugging Face Spaces deploys. scikit-learn + joblib are required only for Live
