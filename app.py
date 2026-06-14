@@ -1177,12 +1177,14 @@ def render_radar_chart(results, baseline, height=RADAR_HEIGHT) -> None:
     without_vals = [baseline["crop_yield_stability"], baseline["water_reservoir_security"],
                     100 - baseline["groundwater_stress"], 100 - (baseline["agricultural_risk"] / 5 * 100), baseline["regional_resilience"]]
     fig = go.Figure()
-    fig.add_trace(go.Scatterpolar(r=without_vals+[without_vals[0]], theta=categories+[categories[0]],
-                                  fill="toself", name="Without Adaptations",
-                                  line={"color":"#f97316","dash":"dash"}, fillcolor="rgba(249,115,22,.1)"))
     fig.add_trace(go.Scatterpolar(r=with_vals+[with_vals[0]], theta=categories+[categories[0]],
                                   fill="toself", name="With Current Adaptations",
                                   line={"color":"#0d9488"}, fillcolor="rgba(13,148,136,.15)"))
+    fig.add_trace(go.Scatterpolar(r=without_vals+[without_vals[0]], theta=categories+[categories[0]],
+                                  fill="none", name="Without Adaptations",
+                                  mode="lines+markers",
+                                  line={"color":"#f97316","dash":"dash","width":3},
+                                  marker={"color":"#f97316","size":7}))
     fig.update_layout(polar={"radialaxis":{"visible":True,"range":[0,100],"ticksuffix":"%"},"angularaxis":{"rotation":90}},
                       showlegend=True, paper_bgcolor="rgba(0,0,0,0)", height=height,
                       margin={"l":40,"r":40,"t":40,"b":40})
