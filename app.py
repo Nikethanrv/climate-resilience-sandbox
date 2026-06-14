@@ -311,7 +311,27 @@ def make_model_emulator(crop_model, water_model, map_fn, stats: dict):
             drought_duration=drought, heat_stress=heat,
             reservoir_storage_pct=reservoir,
         )
-        X = pd.DataFrame([[feats[f] for f in MODEL_FEATURE_ORDER]], columns=list(MODEL_FEATURE_ORDER))
+        adjusted_feats = feats.copy()
+        rainfall_jjas_max = stats.get("rainfall_jjas", {}).get("max", 434.3)
+        rainfall_ond_max  = stats.get("rainfall_ond",  {}).get("max", 782.3)
+        groundnut_max     = stats.get("groundnut_yield", {}).get("max", 3053.47)
+        groundnut_mean    = stats.get("groundnut_yield", {}).get("mean", 1892.23)
+
+        if adapt_dict.get("crops", 0):
+            adjusted_feats["rainfall_jjas"] = min(adjusted_feats["rainfall_jjas"] * 1.08, rainfall_jjas_max)
+            adjusted_feats["rainfall_ond"]  = min(adjusted_feats["rainfall_ond"]  * 1.08, rainfall_ond_max)
+            adjusted_feats["groundnut_yield"] = min(
+                adjusted_feats.get("groundnut_yield", groundnut_mean) * 1.15,
+                groundnut_max,
+            )
+        if adapt_dict.get("irr", 0):
+            adjusted_feats["reservoir_storage_pct"] = min(adjusted_feats["reservoir_storage_pct"] * 1.15, 100.0)
+        if adapt_dict.get("water", 0):
+            adjusted_feats["reservoir_storage_pct"] = min(adjusted_feats["reservoir_storage_pct"] * 1.10, 100.0)
+        if adapt_dict.get("gw", 0):
+            adjusted_feats["reservoir_storage_pct"] = min(adjusted_feats["reservoir_storage_pct"] * 1.05, 100.0)
+
+        X = pd.DataFrame([[adjusted_feats[f] for f in MODEL_FEATURE_ORDER]], columns=list(MODEL_FEATURE_ORDER))
         crop_yield = float(crop_model.predict(X)[0])
         water_sec  = float(water_model.predict(X)[0])
 
@@ -334,14 +354,14 @@ def make_model_emulator(crop_model, water_model, map_fn, stats: dict):
             _res_mean  = stats.get("water_reservoir_security", {}).get("mean", 45.33)
 
             gw_stress = _u.compute_groundwater_stress(
-                feats["reservoir_storage_pct"],
-                feats["rainfall_ond"], feats["rainfall_jjas"],
+                adjusted_feats["reservoir_storage_pct"],
+                adjusted_feats["rainfall_ond"], adjusted_feats["rainfall_jjas"],
                 _res_mean, _rf_ond, _rf_jjas
             ) * 100
 
             ag_risk = _u.compute_agricultural_risk(
                 crop_yield, _crop_mean,
-                feats["rainfall_ond"], feats["rainfall_jjas"],
+                adjusted_feats["rainfall_ond"], adjusted_feats["rainfall_jjas"],
                 _rf_ond, _rf_jjas
             ) * 5
 
@@ -354,6 +374,43 @@ def make_model_emulator(crop_model, water_model, map_fn, stats: dict):
             gw_stress  = adj * 100
             ag_risk    = adj * 5
             resilience = (1 - adj) * 100
+
+        crop_norm = min(
+            100.0,
+            crop_norm
+            + adapt_dict.get("crops", 0) * 8.0
+            + adapt_dict.get("irr", 0) * 3.0
+            + adapt_dict.get("water", 0) * 1.0,
+        )
+        water_norm = min(
+            100.0,
+            water_norm
+            + adapt_dict.get("irr", 0) * 8.0
+            + adapt_dict.get("water", 0) * 6.0
+            + adapt_dict.get("gw", 0) * 4.0,
+        )
+        gw_stress = max(
+            0.0,
+            gw_stress
+            - adapt_dict.get("gw", 0) * 10.0
+            - adapt_dict.get("water", 0) * 8.0
+            - adapt_dict.get("irr", 0) * 4.0,
+        )
+        ag_risk = max(
+            0.0,
+            ag_risk
+            - adapt_dict.get("crops", 0) * 0.50
+            - adapt_dict.get("irr", 0) * 0.25
+            - adapt_dict.get("water", 0) * 0.15
+            - adapt_dict.get("gw", 0) * 0.10,
+        )
+        resilience = round(
+            0.30 * crop_norm
+            + 0.30 * water_norm
+            + 0.20 * (100 - gw_stress)
+            + 0.20 * (100 - ag_risk / 5 * 100),
+            2,
+        )
 
         return {
             "crop_yield_stability":     round(crop_norm, 1),
@@ -1179,12 +1236,14 @@ def render_radar_chart(results, baseline, height=RADAR_HEIGHT) -> None:
     fig = go.Figure()
     fig.add_trace(go.Scatterpolar(r=with_vals+[with_vals[0]], theta=categories+[categories[0]],
                                   fill="toself", name="With Current Adaptations",
-                                  line={"color":"#0d9488"}, fillcolor="rgba(13,148,136,.15)"))
+                                  mode="lines",
+                                  line={"color":"rgba(13,148,136,.75)","width":2},
+                                  fillcolor="rgba(13,148,136,.10)"))
     fig.add_trace(go.Scatterpolar(r=without_vals+[without_vals[0]], theta=categories+[categories[0]],
                                   fill="none", name="Without Adaptations",
                                   mode="lines+markers",
-                                  line={"color":"#f97316","dash":"dash","width":3},
-                                  marker={"color":"#f97316","size":7}))
+                                  line={"color":"#ea580c","dash":"dash","width":4},
+                                  marker={"symbol":"circle-open","color":"#ea580c","size":10,"line":{"color":"#ea580c","width":3}}))
     fig.update_layout(polar={"radialaxis":{"visible":True,"range":[0,100],"ticksuffix":"%"},"angularaxis":{"rotation":90}},
                       showlegend=True, paper_bgcolor="rgba(0,0,0,0)", height=height,
                       margin={"l":40,"r":40,"t":40,"b":40})
