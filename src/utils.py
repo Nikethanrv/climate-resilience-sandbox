@@ -8,7 +8,7 @@ def load_policy_rules(path="data/policy_rules.json"):
     with open(path, "r") as f:
         return json.load(f)
 
-def load_thresholds(path="data/risk_threshold.json"):
+def load_thresholds(path="data/risk_thresholds.json"):
     with open(path, "r") as f:
         return json.load(f)
 

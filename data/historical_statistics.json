@@ -21,12 +21,12 @@
       "max":  83.0
   },
   "agricultural_risk_ui": {
-      "name": "Agricultural Risk Exposure (UI Scale)",
-      "mean": 0.434,
-      "std":  0.5126,
-      "min":  0.0,
-      "max":  1.8895
-  },
+    "name": "Agricultural Risk Exposure (UI Scale)",
+    "mean": 2.17,
+    "std":  2.563,
+    "min":  0.0,
+    "max":  9.4475
+},
   "groundwater_stress": {
       "name": "Groundwater Stress",
       "mean": 0.7458,

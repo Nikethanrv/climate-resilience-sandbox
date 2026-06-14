@@ -1,56 +1,65 @@
 """
-AI Climate Resilience Sandbox — Frontend Phase 2
+AI Climate Resilience Sandbox — Streamlit frontend (Phases 2–4, production)
 
-CHANGELOG (Phase 2 fixes applied):
-  FIX-1  RISK_NORMAL / RISK_ELEVATED / RISK_SEVERE defined once as module
-         constants; all threshold comparisons reference them — not literals.
-  FIX-2  Every section moved into a named render_*() function;
-         main() is the sole top-level caller — zero loose UI code.
-  FIX-3  All Plotly charts now carry config={"displayModeBar": False}
-         (radar previously had no config; map now propagates the flag).
-  FIX-4  Groundwater Stress confirmed: delta_color="inverse" + reversed
-         status-pill scale (_status_gw_stress).
-  FIX-5  get_backend() adapter with @st.cache_resource; sidebar engine
-         badge reports Stub / Partial / Live mode.
-  FIX-6  load_historical_stats() replaces all hardcoded MOCK_STATS usage
-         in the Z-score table and transparency expander.
-  FIX-7  _is_ood() uses hist_stats min/max for input bounds when the JSON
-         file provides them; hardcoded OOD_DEFAULTS remain as fallback.
+Merged final version:
+  - Architecture: Teammate 2's Phase 3/4 production build
+  - Data: Teammate 1's real Tamil Nadu dataset (1991–2017)
+  - Fixes: Z-score based status pills, UI-scale historical stats,
+           IMD SPI thresholds, Tamil Nadu districts, light mode CSS
+
+RUNS FROM PROJECT ROOT:
+  streamlit run app.py
+
+PATH CONTRACT:
+  _HERE = _ROOT = project root (app.py is at root, not in a subfolder)
+  All data/model paths resolve relative to _ROOT.
 """
 
-# ── Stdlib imports ────────────────────────────────────────────────────────────
+# ── Stdlib ─────────────────────────────────────────────────────────────────
+import contextlib
 import inspect
 import json
 import logging
 import os
 import sys
+import time
 
-# ── Third-party imports ───────────────────────────────────────────────────────
+# ── Third-party ────────────────────────────────────────────────────────────
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from src.utils import map_ui_inputs_to_features
-
-# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-# ═════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
+# PATHS  (app.py lives at project root)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_HERE       = os.path.dirname(os.path.abspath(__file__))
+_ROOT       = _HERE                                      # project root
+_DATA_DIR   = os.path.join(_ROOT, "data")
+_MODELS_DIR = os.path.join(_ROOT, "models")
+
+_HIST_STATS_PATH   = os.path.join(_DATA_DIR, "historical_statistics.json")
+_POLICY_RULES_PATH = os.path.join(_DATA_DIR, "policy_rules.json")
+_RISK_THRESH_PATH  = os.path.join(_DATA_DIR, "risk_thresholds.json")
+_REQUIRED_STAT_KEYS = {"mean", "std", "min", "max"}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # MODULE-LEVEL CONSTANTS
-# ═════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
 
-# Path resolution — works regardless of the CWD the user launches from.
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_ROOT = _HERE          # project root
-
-# FIX-1: thresholds defined exactly once as module constants.
+# Risk-level thresholds (adjusted_risk_score, 0–1)
 RISK_NORMAL   = 0.35
 RISK_ELEVATED = 0.50
 RISK_SEVERE   = 0.70
 
-# OOD boundary fallbacks (historical training range 1991–2017).
-# heat_stress >4 means ==5 (top of the slider), matching the original check.
+# UI normalization bounds (raw model output → 0–100 display scale)
+CROP_NORM_MIN,  CROP_NORM_MAX  = 2690.11, 4663.37   # Kg/ha from ICRISAT
+WATER_NORM_MIN, WATER_NORM_MAX = 24.14,   66.50      # % capacity from CWC
+
+# OOD fallback bounds (historical training range 1991–2017)
 OOD_DEFAULTS: dict = {
     "sst_anomaly":      3.0,
     "rainfall_deficit": 80.0,
@@ -58,16 +67,53 @@ OOD_DEFAULTS: dict = {
     "heat_stress":       4.0,
 }
 
-# Fallback stats — used when historical_statistics.json is absent or partial.
+# Single OOD warning copy — identical in alert bar, transparency, and reports
+OOD_WARNING_TEXT = (
+    "Warning: This scenario exceeds the historical range represented in the "
+    "training dataset. Results should be interpreted as exploratory estimates."
+)
+
+SLOW_RESPONSE_SECS = 1.5
+
+# Plotly config reused by every chart
+PLOTLY_CONFIG: dict = {"displayModeBar": False, "scrollZoom": False, "displaylogo": False}
+
+# Chart heights: normal vs compact mode
+MAP_HEIGHT,   MAP_HEIGHT_COMPACT   = 420, 320
+RADAR_HEIGHT, RADAR_HEIGHT_COMPACT = 380, 300
+
+# Report payload keys
+REPORT_PAYLOAD_KEYS = {"scenario", "indicators", "recommendation", "warnings"}
+REPORT_INDICATOR_SPECS = (
+    ("crop_yield_stability",     "Crop Yield Stability",       "%",     "_status_higher_better"),
+    ("water_reservoir_security", "Water Reservoir Security",   "%",     "_status_higher_better"),
+    ("groundwater_stress",       "Groundwater Stress",         "%",     "_status_gw_stress"),
+    ("agricultural_risk",        "Agricultural Risk Exposure", "/ 5.0", "_status_ag_risk"),
+    ("regional_resilience",      "Regional Resilience Score",  "%",     "_status_higher_better"),
+)
+
+REPORT_DISCLAIMER = (
+    "This briefing is generated by an AI surrogate model for scenario planning "
+    "purposes only. It does not constitute an operational forecast or official "
+    "government guidance."
+)
+
+# Fallback stats — keyed to *_ui scale so Z-score panel stays meaningful in stub mode
 MOCK_STATS: dict = {
-    "crop_yield_stability":     {"mean": 72.0, "std": 12.0, "min": 30.0, "max": 100.0},
-    "water_reservoir_security": {"mean": 68.0, "std": 10.0, "min": 20.0, "max": 100.0},
-    "groundwater_stress":       {"mean": 35.0, "std": 15.0, "min":  5.0, "max":  95.0},
-    "agricultural_risk":        {"mean":  2.1, "std":  0.8, "min":  0.0, "max":   5.0},
-    "regional_resilience":      {"mean": 65.0, "std": 11.0, "min": 20.0, "max": 100.0},
+    "crop_yield_stability_ui":     {"mean": 50.0, "std": 20.0, "min": 0.0,  "max": 100.0},
+    "water_reservoir_security_ui": {"mean": 50.0, "std": 20.0, "min": 0.0,  "max": 100.0},
+    "groundwater_stress_ui":       {"mean": 50.0, "std": 15.0, "min": 0.0,  "max": 100.0},
+    "agricultural_risk_ui":        {"mean":  2.5, "std":  1.0, "min": 0.0,  "max":   5.0},
+    "regional_resilience":         {"mean": 65.0, "std": 11.0, "min": 20.0, "max": 100.0},
+    # Raw-scale keys for the live policy engine
+    "crop_yield_stability":     {"mean": 3436.90, "std": 391.55, "min": 2914.97, "max": 4115.59},
+    "water_reservoir_security": {"mean": 45.33,   "std": 13.45,  "min": 24.14,   "max": 66.50},
+    "groundnut_yield":          {"mean": 1892.23, "std": 450.73, "min": 1366.46, "max": 3053.47},
+    "rainfall_ond":             {"mean": 445.47,  "std": 170.23, "min": 149.3,   "max": 782.3},
+    "rainfall_jjas":            {"mean": 311.15,  "std": 86.79,  "min": 94.2,    "max": 434.3},
 }
 
-# Preset scenario definitions.
+# Preset scenarios
 MODERATE_EL_NINO = {"sst_anomaly": 1.2, "rainfall_deficit": 20, "drought_months":  2, "heat_stress": 2}
 SEVERE_DROUGHT   = {"sst_anomaly": 2.0, "rainfall_deficit": 55, "drought_months":  6, "heat_stress": 3}
 EXTREME_ENSO     = {"sst_anomaly": 3.2, "rainfall_deficit": 85, "drought_months": 10, "heat_stress": 5}
@@ -88,10 +134,8 @@ SESSION_DEFAULTS: dict = {
     "adapt_irrigation":  False,
     "adapt_water":       False,
     "active_preset":     "custom",
+    "compact_mode":      False,
 }
-
-_HIST_STATS_PATH   = os.path.join(_ROOT, "data", "historical_statistics.json")
-_REQUIRED_STAT_KEYS = {"mean", "std", "min", "max"}
 
 STRATEGY_NAMES: dict = {
     "crops": "Drought-Resistant Crops",
@@ -99,29 +143,107 @@ STRATEGY_NAMES: dict = {
     "irr":   "Supplemental Irrigation",
     "water": "Water Conservation",
 }
+ORDERED_KEYS: tuple = ("crops", "gw", "irr", "water")
 
-# ═════════════════════════════════════════════════════════════════════════════
-# LOCAL STUB FUNCTIONS  (fallbacks used when teammate files are absent)
-# ═════════════════════════════════════════════════════════════════════════════
+ENGINE_KEY_MAP: dict = {
+    "drought_resistant_crops": "crops",
+    "groundwater_rationing":   "gw",
+    "supplemental_irrigation": "irr",
+    "water_conservation":      "water",
+}
+
+# Z-score directive bands (IMD SPI-based thresholds)
+Z_CRITICAL = -1.5
+Z_SEVERE   = -1.0
+Z_ELEVATED = -0.5
+
+DIRECTIVE_CRITICAL = "🔴 Critical Drought Guidance"
+DIRECTIVE_SEVERE   = "🟠 Severe Stress Protocol"
+DIRECTIVE_ELEVATED = "🟡 Elevated Risk — Enhanced Monitoring"
+DIRECTIVE_NORMAL   = "🟢 Normal Operating Range"
+
+DIRECTIVE_COLORS: dict = {
+    DIRECTIVE_CRITICAL: "#dc2626",
+    DIRECTIVE_SEVERE:   "#ea580c",
+    DIRECTIVE_ELEVATED: "#ca8a04",
+    DIRECTIVE_NORMAL:   "#16a34a",
+}
+
+DIRECTIVE_POLICY_KEY: dict = {
+    DIRECTIVE_CRITICAL: "critical",
+    DIRECTIVE_SEVERE:   "severe",
+    DIRECTIVE_ELEVATED: "elevated",
+    DIRECTIVE_NORMAL:   "normal",
+}
+
+# Per-indicator Z-score metadata: result_key → (display, unit, reversed?, stats_key)
+ZSCORE_META: dict = {
+    "crop_yield_stability":     ("🌾 Crop Yield Stability",    "%",     False, "crop_yield_stability_ui"),
+    "water_reservoir_security": ("💧 Water Reservoir Security", "%",     False, "water_reservoir_security_ui"),
+    "groundwater_stress":       ("🏜 Groundwater Stress",       "%",     True,  "groundwater_stress_ui"),
+    "agricultural_risk":        ("⚠️ Agricultural Risk",        "/ 5.0", True,  "agricultural_risk_ui"),
+    "regional_resilience":      ("🛡 Regional Resilience",      "%",     False, "regional_resilience"),
+}
+
+# Tamil Nadu districts from ICRISAT dataset
+DISTRICTS = [
+    {"name": "Kanchipuram",     "lat": 12.83, "lon": 79.70},
+    {"name": "Cuddalore",       "lat": 11.75, "lon": 79.77},
+    {"name": "Vellore",         "lat": 12.92, "lon": 79.13},
+    {"name": "Salem",           "lat": 11.67, "lon": 78.15},
+    {"name": "Coimbatore",      "lat": 11.01, "lon": 76.97},
+    {"name": "Tiruchirappalli", "lat": 10.79, "lon": 78.70},
+    {"name": "Thanjavur",       "lat": 10.79, "lon": 79.14},
+    {"name": "Madurai",         "lat":  9.93, "lon": 78.12},
+    {"name": "Ramanathapuram",  "lat":  9.37, "lon": 78.83},
+    {"name": "Tirunelveli",     "lat":  8.73, "lon": 77.70},
+    {"name": "The Nilgiris",    "lat": 11.49, "lon": 76.73},
+    {"name": "Kanyakumari",     "lat":  8.09, "lon": 77.55},
+]
+DISTRICT_OFFSETS = [0.10, -0.12, 0.08, -0.15, 0.05, -0.09, 0.13, -0.07, 0.11, -0.10, 0.06, -0.08]
+
+# Strategy descriptions for recommendation cards
+STRATEGY_DESCRIPTIONS: dict = {
+    frozenset(["crops", "water"]):
+        "Reduces crop failure while preserving groundwater. Effective for moderate droughts.",
+    frozenset(["crops", "gw", "irr", "water"]):
+        "Maximum resilience. Requires significant coordination and resources across all sectors.",
+    frozenset(["gw", "irr"]):
+        "Balances short-term water access with long-term aquifer health.",
+    frozenset(["crops", "gw"]):
+        "Cost-effective pairing for early-stage drought response.",
+    frozenset(["irr", "water"]):
+        "Strong for water security; moderate crop protection.",
+}
+DEFAULT_STRATEGY_DESC = (
+    "Moderate improvement. Consider pairing with additional measures for stronger outcomes."
+)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# UTILITY CONTEXT MANAGER
+# ═══════════════════════════════════════════════════════════════════════════
+
+@contextlib.contextmanager
+def _chdir(path: str):
+    prev = os.getcwd()
+    try:
+        os.chdir(path)
+        yield
+    finally:
+        os.chdir(prev)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# STUB FUNCTIONS  (replaced by live modules via backend adapter)
+# ═══════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=60)
-def run_climate_emulator(
-    sst: float,
-    rainfall: float,
-    drought: float,
-    heat: float,
-    adapt_dict: dict,
-) -> dict:
-    """
-    Stub emulator — Teammate 1 replaces this via the backend adapter.
-    Returns dict with 6 float indicators.
-    """
+def run_climate_emulator(sst, rainfall, drought, heat, adapt_dict) -> dict:
     base  = sst / 3.5 * 0.4 + rainfall / 100 * 0.4 + drought / 12 * 0.2
     bonus = (
-        adapt_dict.get("crops", 0) * 0.08
-        + adapt_dict.get("gw",    0) * 0.06
-        + adapt_dict.get("irr",   0) * 0.07
-        + adapt_dict.get("water", 0) * 0.05
+        adapt_dict.get("crops", 0) * 0.08 + adapt_dict.get("gw",    0) * 0.06
+        + adapt_dict.get("irr", 0) * 0.07 + adapt_dict.get("water", 0) * 0.05
     )
     adj = max(0.0, min(1.0, base - bonus))
     return {
@@ -135,13 +257,11 @@ def run_climate_emulator(
 
 
 def calculate_zscore(value: float, mean: float, std: float) -> float:
-    """Stub — Teammate 3 replaces with utils.calculate_zscore."""
     return round((value - mean) / std if std > 0 else 0.0, 2)
 
 
 @st.cache_data(ttl=3600)
-def load_policy_rules() -> dict:
-    """Stub — Teammate 3 replaces with utils.load_policy_rules."""
+def load_policy_rules_stub() -> dict:
     return {
         "Normal":         "Maintain standard monitoring. No immediate action required.",
         "Elevated Risk":  "Activate early-warning protocols. Review irrigation schedules.",
@@ -150,106 +270,132 @@ def load_policy_rules() -> dict:
     }
 
 
-def load_risk_thresholds() -> dict:
-    """Stub — Teammate 3 replaces with utils.load_thresholds."""
-    return {
-        "normal":   RISK_NORMAL,
-        "elevated": RISK_ELEVATED,
-        "severe":   RISK_SEVERE,
-    }
+def load_risk_thresholds_stub() -> dict:
+    return {"normal": RISK_NORMAL, "elevated": RISK_ELEVATED, "severe": RISK_SEVERE}
 
-def map_ui_to_input_features(
-    sst_anomaly, rainfall_deficit_pct,
-    drought_duration, heat_stress,
-    reservoir_storage_pct, year=2004
-):
-    """Stub mapping - replaced by utils.py when available"""
-    oni_djf = sst_anomaly * (2.6 / 3.5)
-    rainfall_jjas_mean = 311.1
-    rainfall_ond_mean = 445.5
-    rainfall_jjas = rainfall_jjas_mean * (1 - rainfall_deficit_pct/100)
-    duration_multiplier = 1 + (drought_duration / 12) * 0.5
-    rainfall_ond = max(0, rainfall_ond_mean * (1 - rainfall_deficit_pct/100) * duration_multiplier)
 
+def stub_map_inputs(sst_anomaly, rainfall_deficit_pct, drought_duration,
+                    heat_stress, reservoir_storage_pct, year=2004) -> dict:
+    heat_mult = 1 + (heat_stress - 1) * 0.10
+    oni_djf   = min(sst_anomaly * (2.6 / 3.5) * heat_mult, 2.6)
+    rf_jjas   = 311.1 * (1 - rainfall_deficit_pct / 100)
+    dur_mult  = 1 + (drought_duration / 12) * 0.5
+    rf_ond    = max(0.0, 445.5 * (1 - (rainfall_deficit_pct / 100) * dur_mult))
     return {
-        "oni_djf": round(oni_djf, 4),
-        "rainfall_jjas": round(rainfall_jjas, 2),
-        "rainfall_ond": round(rainfall_ond, 2),
+        "oni_djf":               round(oni_djf, 4),
+        "rainfall_jjas":         round(rf_jjas, 2),
+        "rainfall_ond":          round(rf_ond, 2),
         "reservoir_storage_pct": round(reservoir_storage_pct, 2),
-        "year": year,
-        "groundnut_yield": 1892.23,
+        "year":                  year,
+        "groundnut_yield":       1892.23,
     }
 
-# ═════════════════════════════════════════════════════════════════════════════
-# BACKEND ADAPTER  (FIX-5)
-# ═════════════════════════════════════════════════════════════════════════════
 
-def make_model_emulator(crop_model, water_model):
-    """
-    Factory that returns a drop-in replacement for run_climate_emulator.
-    Uses map_ui_inputs_to_features() to convert UI slider values to model inpput features matching train_model.py feature order:
-    [oni_djf, rainfall_jjas, rainfall_ond, reservoir_storage_pct, year, groundnut_yield]
-    """
-    def _emulator(
-        sst: float,
-        rainfall: float,
-        drought: float,
-        heat: float,
-        adapt_dict: dict,
-    ) -> dict:
-        model_inputs = map_ui_inputs_to_features(
-            sst_anomaly=sst,
-            rainfall_deficit_pct=rainfall,
-            drought_duration=drought,
-            heat_stress=heat,
-            reservoir_storage_pct=max(10.0, load_historical_stats()["water_reservoir_security"]["max"] * (1 - rainfall / 100))
+# ═══════════════════════════════════════════════════════════════════════════
+# BACKEND ADAPTER
+# ═══════════════════════════════════════════════════════════════════════════
+
+MODEL_FEATURE_ORDER: tuple = (
+    "oni_djf", "rainfall_jjas", "rainfall_ond",
+    "reservoir_storage_pct", "year", "groundnut_yield",
+)
+
+
+def make_model_emulator(crop_model, water_model, map_fn, stats: dict):
+    water_max = stats.get("water_reservoir_security", {}).get("max", WATER_NORM_MAX)
+
+    def _emulator(sst, rainfall, drought, heat, adapt_dict) -> dict:
+        reservoir = max(10.0, water_max * (1 - rainfall / 100))
+        feats = map_fn(
+            sst_anomaly=sst, rainfall_deficit_pct=rainfall,
+            drought_duration=drought, heat_stress=heat,
+            reservoir_storage_pct=reservoir,
         )
-
-        feature_order = [
-            "oni_djf", "rainfall_jjas", "rainfall_ond", "reservoir_storage_pct", "year", "groundnut_yield"
-        ]
-
-        X = pd.DataFrame([[model_inputs[f] for f in feature_order]], columns=feature_order)
-
+        X = pd.DataFrame([[feats[f] for f in MODEL_FEATURE_ORDER]], columns=list(MODEL_FEATURE_ORDER))
         crop_yield = float(crop_model.predict(X)[0])
         water_sec  = float(water_model.predict(X)[0])
 
-        # Derived indicators
+        crop_norm  = max(0.0, min(100.0, (crop_yield - CROP_NORM_MIN)  / (CROP_NORM_MAX  - CROP_NORM_MIN)  * 100))
+        water_norm = max(0.0, min(100.0, (water_sec  - WATER_NORM_MIN) / (WATER_NORM_MAX - WATER_NORM_MIN) * 100))
+
         base  = sst / 3.5 * 0.4 + rainfall / 100 * 0.4 + drought / 12 * 0.2
         bonus = (
-            adapt_dict.get("crops", 0) * 0.08
-            + adapt_dict.get("gw",    0) * 0.06
-            + adapt_dict.get("irr",   0) * 0.07
-            + adapt_dict.get("water", 0) * 0.05
+            adapt_dict.get("crops", 0) * 0.08 + adapt_dict.get("gw",   0) * 0.06
+            + adapt_dict.get("irr", 0) * 0.07 + adapt_dict.get("water",0) * 0.05
         )
         adj = max(0.0, min(1.0, base - bonus))
 
-        stats = load_historical_stats()
+        # Use real utils functions so indicators match historical stats scale
+        try:
+            import src.utils as _u
+            _rf_ond    = stats.get("rainfall_ond",  {}).get("mean", 445.47)
+            _rf_jjas   = stats.get("rainfall_jjas", {}).get("mean", 311.15)
+            _crop_mean = stats.get("crop_yield_stability",     {}).get("mean", 3436.90)
+            _res_mean  = stats.get("water_reservoir_security", {}).get("mean", 45.33)
 
-        # Normalize crop yield to 0 - 100 scale for UI
-        # Historical range
-        crop_norm = (crop_yield - 2690.11) / (4663.37 - 2690.11) * 100
-        crop_norm = max(0.0, min(100.0, crop_norm))
-        
-        # Normalize water security to 0 - 100 scale for UI
-        # Historical range
-        water_norm = (water_sec - 24.14) / (66.50 - 24.14) * 100
-        water_norm = max(0.0, min(100.0, water_norm))
+            gw_stress = _u.compute_groundwater_stress(
+                feats["reservoir_storage_pct"],
+                feats["rainfall_ond"], feats["rainfall_jjas"],
+                _res_mean, _rf_ond, _rf_jjas
+            ) * 100
+
+            ag_risk = _u.compute_agricultural_risk(
+                crop_yield, _crop_mean,
+                feats["rainfall_ond"], feats["rainfall_jjas"],
+                _rf_ond, _rf_jjas
+            ) * 5
+
+            resilience = _u.compute_resilience_score(
+                crop_yield, water_sec,
+                ag_risk / 5,
+                _crop_mean, _res_mean
+            )
+        except Exception:
+            gw_stress  = adj * 100
+            ag_risk    = adj * 5
+            resilience = (1 - adj) * 100
 
         return {
             "crop_yield_stability":     round(crop_norm, 1),
-            "water_reservoir_security": round(water_norm,  1),
-            "groundwater_stress":       round(adj * 100, 1),
-            "agricultural_risk":        round(adj * 5,   2),
-            "regional_resilience":      round((1 - adj) * 100, 1),
+            "water_reservoir_security": round(water_norm, 1),
+            "groundwater_stress":       round(gw_stress, 1),
+            "agricultural_risk":        round(ag_risk, 2),
+            "regional_resilience":      round(resilience, 2),
             "adjusted_risk_score":      adj,
         }
-
     return _emulator
 
 
+def _normalize_combo(combo_keys: frozenset, score: float, description=None) -> dict:
+    return {
+        "combo_keys": combo_keys,
+        "strategies": [STRATEGY_NAMES[k] for k in ORDERED_KEYS if k in combo_keys],
+        "score":      round(float(score), 1),
+        "description": description,
+    }
+
+
+def _normalize_engine_row(row: dict) -> dict:
+    flags = row.get("policy_flags", {})
+    combo_keys = frozenset(
+        ENGINE_KEY_MAP[k] for k, v in flags.items() if v and k in ENGINE_KEY_MAP
+    )
+    score = row.get("resilience_score", row.get("score", 0.0))
+    return _normalize_combo(combo_keys, score)
+
+
+def _make_live_compare(compare_fn, normalizer, needs_chdir: bool):
+    def _compare(scenario: dict) -> list:
+        if needs_chdir:
+            with _chdir(_ROOT):
+                rows = compare_fn(scenario)
+        else:
+            rows = compare_fn(scenario)
+        return sorted([normalizer(r) for r in rows], key=lambda x: x["score"], reverse=True)
+    return _compare
+
+
 def _utils_fn_ok(fn, min_params: int) -> bool:
-    """Return True if fn is callable with at least min_params positional args."""
     try:
         return len(inspect.signature(fn).parameters) >= min_params
     except (TypeError, ValueError):
@@ -258,116 +404,139 @@ def _utils_fn_ok(fn, min_params: int) -> bool:
 
 @st.cache_resource
 def get_backend() -> dict:
-    """
-    Returns a dict of callables. Prefers real teammate modules, falls back
-    to local stubs. Logged, never raises.
-
-    Keys:
-      source        — "stub" | "partial" | "live"
-      emulator      — callable(sst, rainfall, drought, heat, adapt_dict) -> dict
-      zscore        — callable(value, mean, std) -> float
-      policy_rules  — callable() -> dict
-      thresholds    — callable() -> dict
-    """
     backend: dict = {
-        "source":       "stub",
-        "emulator":     run_climate_emulator,
-        "zscore":       calculate_zscore,
-        "policy_rules": load_policy_rules,
-        "thresholds":   load_risk_thresholds,
+        "source":          "stub",
+        "emulator":        run_climate_emulator,
+        "zscore":          calculate_zscore,
+        "policy_rules":    load_policy_rules_stub,
+        "thresholds":      load_risk_thresholds_stub,
+        "map_inputs":      stub_map_inputs,
+        "compare":         None,
+        "compare_is_live": False,
+        "build_payload":   None,
+        "payload_is_live": False,
+        "detail":          {},
     }
+    detail = backend["detail"]
+    utils  = None
 
-    # ── Teammate 3: utils.py ─────────────────────────────────────────────────
+    # ── src/utils.py ────────────────────────────────────────────────────────
     try:
-        import src.utils as utils  # noqa: PLC0415
+        if _ROOT not in sys.path:
+            sys.path.insert(0, _ROOT)
+        import src.utils as _utils  # noqa: PLC0415
 
-        z_ok  = _utils_fn_ok(getattr(utils, "calculate_zscore",   None), 3)
-        pr_ok = _utils_fn_ok(getattr(utils, "load_policy_rules",  None), 0)
-        th_ok = _utils_fn_ok(getattr(utils, "load_thresholds",    None), 0)
-        map_ok = _utils_fn_ok(getattr(utils, "map_ui_inputs_to_features", None), 5)
+        z_ok   = _utils_fn_ok(getattr(_utils, "calculate_zscore",        None), 3)
+        pr_ok  = _utils_fn_ok(getattr(_utils, "load_policy_rules",       None), 0)
+        th_ok  = _utils_fn_ok(getattr(_utils, "load_thresholds",         None), 0)
+        map_ok = _utils_fn_ok(getattr(_utils, "map_ui_inputs_to_features",None), 5)
 
         if z_ok and pr_ok and th_ok:
+            utils = _utils
             backend.update(
-                zscore=utils.calculate_zscore,
-                policy_rules=utils.load_policy_rules,
-                thresholds=utils.load_thresholds,
+                zscore=_utils.calculate_zscore,
+                policy_rules=lambda: _utils.load_policy_rules(_POLICY_RULES_PATH),
+                thresholds=lambda: _utils.load_thresholds(_RISK_THRESH_PATH),
                 source="partial",
             )
-            logging.info("utils.py loaded — teammate zscore/policy/thresholds active")
             if map_ok:
-                global map_ui_inputs_to_features
-                map_ui_inputs_to_features = utils.map_ui_inputs_to_features
-                backend["source"] = "live"
-                logging.info("map_ui_inputs_to_features loaded from utils.py")
+                backend["map_inputs"] = _utils.map_ui_inputs_to_features
+            detail["utils"] = "loaded" + (" +map_inputs" if map_ok else "")
+            logging.info("src.utils loaded")
         else:
-            logging.info("utils.py found but functions not yet fully implemented")
-    except ImportError:
-        logging.info("utils.py not present — using stubs")
+            detail["utils"] = "found but incomplete"
+    except Exception as exc:  # noqa: BLE001
+        detail["utils"] = f"not loaded ({type(exc).__name__})"
+        logging.info("src.utils not usable: %s", exc)
 
-    # ── Teammate 1: joblib models ────────────────────────────────────────────
+    stats = load_historical_stats()
+
+    # ── models/*.joblib ──────────────────────────────────────────────────────
+    crop_model = water_model = None
     try:
-        import joblib  # lazy import — app works without scikit-learn
-
-        crop_path  = os.path.join(_ROOT, "models", "crop_model.joblib")
-        water_path = os.path.join(_ROOT, "models", "water_model.joblib")
-
-        if (
-            os.path.exists(crop_path)
-            and os.path.getsize(crop_path) > 0
-            and os.path.exists(water_path)
-            and os.path.getsize(water_path) > 0
-        ):
+        import joblib
+        crop_path  = os.path.join(_MODELS_DIR, "crop_model.joblib")
+        water_path = os.path.join(_MODELS_DIR, "water_model.joblib")
+        if (os.path.exists(crop_path) and os.path.getsize(crop_path) > 0
+                and os.path.exists(water_path) and os.path.getsize(water_path) > 0):
             crop_model  = joblib.load(crop_path)
             water_model = joblib.load(water_path)
-            backend["emulator"] = make_model_emulator(crop_model, water_model)
-            backend["source"]   = "live"
-            logging.info("Live models loaded from %s", crop_path)
+            backend["emulator"] = make_model_emulator(
+                crop_model, water_model, backend["map_inputs"], stats
+            )
+            backend["source"] = "live"
+            detail["models"] = "loaded (crop R²=0.52, water R²=0.83)"
+            logging.info("Live models loaded")
         else:
-            logging.info("Model files absent or empty — using stub emulator")
+            detail["models"] = "absent — stub emulator"
     except Exception as exc:  # noqa: BLE001
-        logging.warning("Model load failed — using stub emulator: %s", exc)
+        detail["models"] = f"load failed ({type(exc).__name__})"
+        logging.warning("Model load failed: %s", exc)
+
+    # ── policy comparison engine ─────────────────────────────────────────────
+    compare_wired = False
+    if not compare_wired and utils is not None and crop_model is not None:
+        eval_ok = _utils_fn_ok(getattr(utils, "evaluate_all_policies", None), 5)
+        if eval_ok:
+            policy_rules = backend["policy_rules"]()
+
+            def _engine(scenario: dict) -> list:
+                climate_inputs = backend["map_inputs"](
+                    sst_anomaly=scenario["sst"],
+                    rainfall_deficit_pct=scenario["rainfall"],
+                    drought_duration=scenario["drought"],
+                    heat_stress=scenario["heat"],
+                    reservoir_storage_pct=max(
+                        10.0,
+                        stats.get("water_reservoir_security", {}).get("max", WATER_NORM_MAX)
+                        * (1 - scenario["rainfall"] / 100)
+                    ),
+                )
+                return utils.evaluate_all_policies(
+                    climate_inputs, crop_model, water_model, stats, policy_rules, top_n=16
+                )
+
+            backend["compare"] = _make_live_compare(_engine, _normalize_engine_row, needs_chdir=True)
+            backend["compare_is_live"] = True
+            compare_wired = True
+            detail["compare"] = "live (utils.evaluate_all_policies)"
+            logging.info("Live policy engine wired")
+
+    if not compare_wired:
+        backend["compare"] = lambda scenario: _fallback_compare_combos(
+            scenario["sst"], scenario["rainfall"], scenario["drought"], scenario["heat"]
+        )
+        backend["compare_is_live"] = False
+        detail.setdefault("compare", "local 16-combo fallback")
+
+    backend["build_payload"] = _local_build_payload
+    backend["payload_is_live"] = False
+    detail.setdefault("report", "local payload builder")
 
     return backend
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# HISTORICAL STATISTICS LOADER  (FIX-6 / FIX-7)
-# ═════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
+# HISTORICAL STATISTICS
+# ═══════════════════════════════════════════════════════════════════════════
 
 @st.cache_data
 def load_historical_stats() -> dict:
-    """
-    Loads historical_statistics.json (Teammate 1 deliverable).
-    Falls back to MOCK_STATS per-indicator if the file is absent, unreadable,
-    or missing required keys.  Adds a ``_using_mock`` bool to the result so
-    callers can show a notice to the team.
-    Also absorbs input-parameter bounds (sst_anomaly, rainfall_deficit,
-    drought_months, heat_stress) when Teammate 1 includes them — those drive
-    the OOD check in _is_ood().
-    """
     result: dict = {k: dict(v) for k, v in MOCK_STATS.items()}
     result["_using_mock"] = True
-
     try:
         with open(_HIST_STATS_PATH, encoding="utf-8") as fh:
             raw: dict = json.load(fh)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return result  # all mock
+        return result
 
-    any_mock = False
-    # Load all keys from JSON, not just MOCK_STATS keys
     for indicator, entry in raw.items():
         if indicator.startswith("_"):
             continue
         if isinstance(entry, dict) and _REQUIRED_STAT_KEYS.issubset(entry):
             result[indicator] = {k: entry[k] for k in _REQUIRED_STAT_KEYS}
 
-    # Check if any MOCK_STATS keys are missing
-    for indicator in MOCK_STATS:
-        if indicator not in result:
-            any_mock = True
-
-    # Absorb input-feature bounds when Teammate 1 provides them (used for OOD).
+    any_mock = any(key not in raw for key in MOCK_STATS)
     for input_key in ("sst_anomaly", "rainfall_deficit", "drought_months", "heat_stress"):
         if input_key in raw and isinstance(raw[input_key], dict):
             result[input_key] = raw[input_key]
@@ -376,17 +545,9 @@ def load_historical_stats() -> dict:
     return result
 
 
-def _is_ood(
-    sst: float,
-    rainfall: float,
-    drought: float,
-    heat: float,
-    hist_stats: dict,
-) -> bool:
-    """True if any input exceeds the historical training max (FIX-7)."""
-    def _max(key: str, fallback: float) -> float:
+def _is_ood(sst, rainfall, drought, heat, hist_stats) -> bool:
+    def _max(key, fallback):
         return hist_stats.get(key, {}).get("max", fallback)
-
     return (
         sst      > _max("sst_anomaly",      OOD_DEFAULTS["sst_anomaly"])
         or rainfall > _max("rainfall_deficit", OOD_DEFAULTS["rainfall_deficit"])
@@ -395,381 +556,428 @@ def _is_ood(
     )
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# REPORT GENERATORS
-# ═════════════════════════════════════════════════════════════════════════════
+def get_ood_warnings(sst, rainfall, drought, heat, hist_stats) -> list:
+    return [OOD_WARNING_TEXT] if _is_ood(sst, rainfall, drought, heat, hist_stats) else []
 
-def generate_txt_report(
-    scenario: dict,
-    results: dict,
-    top_strategy: dict,
-    ood: bool,
-) -> str:
-    """Generates plain-text action briefing for download."""
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DIRECTIVE HELPERS  (IMD SPI-based thresholds)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _effective_z(z: float, reversed_dir: bool) -> float:
+    return -z if reversed_dir else z
+
+
+def classify_directive(z: float, reversed_dir: bool) -> str:
+    eff = _effective_z(z, reversed_dir)
+    if eff < Z_CRITICAL:
+        return DIRECTIVE_CRITICAL
+    if eff < Z_SEVERE:
+        return DIRECTIVE_SEVERE
+    if eff < Z_ELEVATED:
+        return DIRECTIVE_ELEVATED
+    return DIRECTIVE_NORMAL
+
+
+def _policy_guidance(policy_rules: dict, category: str) -> str:
+    entry = policy_rules.get(category)
+    if isinstance(entry, dict):
+        desc = entry.get("description", "").strip()
+        recs = entry.get("recommendations", [])
+        if recs:
+            first = recs[0]
+            text  = first.get("text", "") if isinstance(first, dict) else str(first)
+            if text:
+                return f"{desc} First action: {text}".strip()
+        return desc
+    if isinstance(entry, str):
+        return entry
+    stub_map = {"critical": "Critical Alert", "severe": "Severe Stress",
+                "elevated": "Elevated Risk",  "normal": "Normal"}
+    stub_key = stub_map.get(category)
+    if stub_key and isinstance(policy_rules.get(stub_key), str):
+        return policy_rules[stub_key]
+    return "No guidance available."
+
+
+def _directive_cell_style(val: str) -> str:
+    for label, color in DIRECTIVE_COLORS.items():
+        if isinstance(val, str) and val.startswith(label):
+            return f"background-color:{color};color:white;font-weight:600;"
+    return ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# REPORT PIPELINE  (one payload → TXT / PDF / CSV)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _validate_payload(payload) -> bool:
+    return (
+        isinstance(payload, dict)
+        and REPORT_PAYLOAD_KEYS <= set(payload)
+        and all(isinstance(payload.get(k), (list, dict)) for k in ("indicators", "warnings", "scenario", "recommendation"))
+    )
+
+
+def _local_build_payload(scenario: dict, results: dict, top_strategy: dict) -> dict:
     from datetime import datetime
+    status_fns = {
+        "_status_higher_better": _status_higher_better,
+        "_status_gw_stress":     _status_gw_stress,
+        "_status_ag_risk":       _status_ag_risk,
+    }
+    indicators = []
+    for result_key, name, unit, fn_name in REPORT_INDICATOR_SPECS:
+        value = results[result_key]
+        label, _ = status_fns[fn_name](value)
+        indicators.append({"name": name, "value": value, "unit": unit, "status": label})
+    active   = [STRATEGY_NAMES[k] for k in ORDERED_KEYS if scenario["adapt_dict"].get(k)]
+    warnings = get_ood_warnings(
+        scenario["sst"], scenario["rainfall"], scenario["drought"], scenario["heat"],
+        load_historical_stats(),
+    )
+    return {
+        "scenario": {
+            "sst": scenario["sst"], "rainfall": scenario["rainfall"],
+            "drought": scenario["drought"], "heat": scenario["heat"],
+            "active_adaptations": active,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M UTC"),
+        },
+        "indicators":     indicators,
+        "recommendation": {"strategies": list(top_strategy["strategies"]), "score": top_strategy["score"]},
+        "warnings":       list(warnings),
+    }
 
-    active = [k for k, v in scenario["adapt_dict"].items() if v] or ["None selected"]
+
+def report_filename(ext: str) -> str:
+    from datetime import datetime
+    return f"resilience_briefing_{datetime.now().strftime('%Y%m%d_%H%M')}.{ext}"
+
+
+def fpdf_available() -> bool:
+    import importlib.util
+    return importlib.util.find_spec("fpdf") is not None
+
+
+def _latin1(text) -> str:
+    s = str(text)
+    for bad, good in (("✓","[x]"),("✅","[x]"),("⚠️","[!]"),("•","-"),("–","-"),("—","-"),("…","...")):
+        s = s.replace(bad, good)
+    return s.encode("latin-1", "ignore").decode("latin-1")
+
+
+def payload_to_txt(payload: dict) -> str:
+    s, ind = payload["scenario"], payload["indicators"]
+    rec, warns = payload["recommendation"], payload["warnings"]
+    active = s["active_adaptations"] or ["None selected"]
+    ind_lines = "\n".join(f"{i['name']:<28}: {i['value']}{i['unit']}  [{i['status']}]" for i in ind)
+    warn_block = "\n".join("WARNING: " + w for w in warns) if warns else "Scenario within historical training range (1991-2017)."
     return f"""
-═══════════════════════════════════════════════════
-AI CLIMATE RESILIENCE SANDBOX — ACTION BRIEFING
-Generated: {datetime.now().strftime("%Y-%m-%d %H:%M UTC")}
-═══════════════════════════════════════════════════
+===================================================
+AI CLIMATE RESILIENCE SANDBOX - ACTION BRIEFING
+Generated: {s["timestamp"]}
+===================================================
 
 SCENARIO PARAMETERS
-───────────────────
-Sea Surface Temperature Anomaly : {scenario["sst"]}°C
-Monsoon Rainfall Deficit        : {scenario["rainfall"]}%
-Drought Duration                : {scenario["drought"]} months
-Heat Stress Index               : {scenario["heat"]} / 5
+-------------------
+Sea Surface Temperature Anomaly : {s["sst"]} C
+Monsoon Rainfall Deficit        : {s["rainfall"]} %
+Drought Duration                : {s["drought"]} months
+Heat Stress Index               : {s["heat"]} / 5
 
 ADAPTATION MEASURES ACTIVE
-──────────────────────────
-{chr(10).join("  ✓ " + a for a in active)}
+--------------------------
+{chr(10).join("  - " + a for a in active)}
 
 KEY RISK INDICATORS
-───────────────────
-Crop Yield Stability       : {results["crop_yield_stability"]}%
-Water Reservoir Security   : {results["water_reservoir_security"]}%
-Groundwater Stress         : {results["groundwater_stress"]}%
-Agricultural Risk Exposure : {results["agricultural_risk"]} / 5.0
-Regional Resilience Score  : {results["regional_resilience"]}%
+-------------------
+{ind_lines}
 
 TOP RECOMMENDED STRATEGY
-─────────────────────────
-Strategies : {", ".join(top_strategy["strategies"]) or "None"}
-Projected Resilience : {top_strategy["score"]}%
+------------------------
+Strategies           : {", ".join(rec["strategies"]) or "None"}
+Projected Resilience : {rec["score"]}%
 
-TRANSPARENCY NOTE
-─────────────────
-{"⚠️  OUT-OF-DISTRIBUTION: Scenario exceeds training range (1991–2017)." if ood else "✅  Scenario within historical training range (1991–2017)."}
-Model: Random Forest Regressor | Training period: 1991–2017
+WARNINGS
+--------
+{warn_block}
+Model: Random Forest Regressor | Training period: 1991-2017
 
-───────────────────────────────────────────────────
+---------------------------------------------------
 DISCLAIMER
-This briefing is generated by an AI surrogate model for
-scenario planning purposes only. It does not constitute
-an operational forecast or official government guidance.
-═══════════════════════════════════════════════════
+{REPORT_DISCLAIMER}
+===================================================
 """
 
 
-def generate_pdf_report(
-    scenario: dict,
-    results: dict,
-    top_strategy: dict,
-    ood: bool,
-) -> bytes:
-    """Generates PDF action briefing for download. Returns bytes."""
-    from datetime import datetime
+def payload_to_csv(payload: dict) -> bytes:
+    s, rec = payload["scenario"], payload["recommendation"]
+    row = {
+        "SST_Anomaly_C": s["sst"], "Rainfall_Deficit_pct": s["rainfall"],
+        "Drought_Months": s["drought"], "Heat_Stress": s["heat"],
+        "Active_Adaptations": "; ".join(s["active_adaptations"]) or "None",
+    }
+    for i in payload["indicators"]:
+        col = i["name"].replace(" ", "_")
+        row[col] = i["value"]
+        row[f"{col}_Status"] = i["status"]
+    row["Top_Strategy"] = ", ".join(rec["strategies"]) or "None"
+    row["Projected_Resilience_pct"] = rec["score"]
+    row["Warnings"] = "; ".join(payload["warnings"]) or "None"
+    return pd.DataFrame([row]).to_csv(index=False).encode("utf-8-sig")
+
+
+def payload_to_pdf(payload: dict) -> bytes:
     from fpdf import FPDF
+    s, ind = payload["scenario"], payload["indicators"]
+    rec, warns = payload["recommendation"], payload["warnings"]
 
     pdf = FPDF()
     pdf.add_page()
-
     pdf.set_fill_color(26, 107, 107)
     pdf.rect(0, 0, 210, 22, "F")
     pdf.set_font("Helvetica", "B", 14)
     pdf.set_text_color(255, 255, 255)
     pdf.set_xy(10, 6)
-    pdf.cell(0, 10, "AI Climate Resilience Sandbox - Action Briefing")
-
+    pdf.cell(0, 10, _latin1("AI Climate Resilience Sandbox - Action Briefing"))
     pdf.set_font("Helvetica", "", 9)
     pdf.set_text_color(200, 240, 240)
     pdf.set_xy(10, 15)
-    pdf.cell(0, 6, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}")
-
+    pdf.cell(0, 6, _latin1(f"Generated: {s['timestamp']}"))
     pdf.set_text_color(30, 30, 30)
     pdf.set_y(28)
 
-    if ood:
+    if warns:
         pdf.set_fill_color(254, 226, 226)
         pdf.set_draw_color(220, 38, 38)
         pdf.set_font("Helvetica", "B", 9)
         pdf.set_text_color(153, 27, 27)
-        pdf.multi_cell(
-            0, 7,
-            "OUT-OF-DISTRIBUTION WARNING: Parameters exceed training range. "
-            "Interpret results as exploratory estimates only.",
-            border=1, fill=True,
-        )
+        for w in warns:
+            pdf.multi_cell(0, 7, _latin1(w), border=1, fill=True)
         pdf.set_text_color(30, 30, 30)
         pdf.ln(3)
 
-    def section(title: str) -> None:
+    def section(title):
         pdf.set_font("Helvetica", "B", 11)
         pdf.set_fill_color(240, 253, 250)
         pdf.set_text_color(26, 107, 107)
-        pdf.cell(0, 8, title, new_x="LMARGIN", new_y="NEXT", fill=True)
+        pdf.cell(0, 8, _latin1(title), new_x="LMARGIN", new_y="NEXT", fill=True)
         pdf.set_text_color(30, 30, 30)
         pdf.set_font("Helvetica", "", 10)
         pdf.ln(1)
 
-    def row(label: str, value, unit: str = "") -> None:
+    def row(label, value):
         pdf.set_font("Helvetica", "", 10)
-        pdf.cell(90, 7, label)
+        pdf.cell(95, 7, _latin1(label))
         pdf.set_font("Helvetica", "B", 10)
-        pdf.cell(0, 7, f"{value}{unit}", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 7, _latin1(value), new_x="LMARGIN", new_y="NEXT")
 
     section("SCENARIO PARAMETERS")
-    row("SST Anomaly",       scenario["sst"],      " C")
-    row("Rainfall Deficit",  scenario["rainfall"], "%")
-    row("Drought Duration",  scenario["drought"],  " months")
-    row("Heat Stress Index", scenario["heat"],     " / 5")
+    row("SST Anomaly",       f"{s['sst']} C")
+    row("Rainfall Deficit",  f"{s['rainfall']} %")
+    row("Drought Duration",  f"{s['drought']} months")
+    row("Heat Stress Index", f"{s['heat']} / 5")
     pdf.ln(3)
 
     section("ADAPTATION MEASURES ACTIVE")
-    active = [k for k, v in scenario["adapt_dict"].items() if v]
-    names = {
-        "crops": "Drought-Resistant Crop Program",
-        "gw":    "Emergency Groundwater Rationing",
-        "irr":   "Supplemental Irrigation Support",
-        "water": "Water Conservation Initiative",
-    }
+    active = s["active_adaptations"]
     if active:
-        for k in active:
-            pdf.cell(0, 7, f"  -  {names[k]}", new_x="LMARGIN", new_y="NEXT")
+        for a in active:
+            pdf.cell(0, 7, _latin1(f"  -  {a}"), new_x="LMARGIN", new_y="NEXT")
     else:
-        pdf.cell(0, 7, "  No measures active", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 7, _latin1("  No measures active"), new_x="LMARGIN", new_y="NEXT")
     pdf.ln(3)
 
     section("KEY RISK INDICATORS")
-    row("Crop Yield Stability",       results["crop_yield_stability"],     "%")
-    row("Water Reservoir Security",   results["water_reservoir_security"], "%")
-    row("Groundwater Stress",         results["groundwater_stress"],       "%")
-    row("Agricultural Risk Exposure", results["agricultural_risk"],        " / 5.0")
-    row("Regional Resilience Score",  results["regional_resilience"],      "%")
+    for i in ind:
+        row(i["name"], f"{i['value']}{i['unit']}  [{i['status']}]")
     pdf.ln(3)
 
     section("TOP RECOMMENDED STRATEGY")
-    strats = ", ".join(top_strategy["strategies"]) or "None"
-    pdf.multi_cell(0, 7, f"Strategies: {strats}")
-    row("Projected Resilience", top_strategy["score"], "%")
+    pdf.multi_cell(0, 7, _latin1("Strategies: " + (", ".join(rec["strategies"]) or "None")))
+    row("Projected Resilience", f"{rec['score']}%")
     pdf.ln(3)
 
     pdf.set_font("Helvetica", "I", 8)
     pdf.set_text_color(120, 120, 120)
-    pdf.multi_cell(
-        0, 5,
-        "DISCLAIMER: This briefing is generated by an AI surrogate model "
-        "for scenario planning purposes only. It does not constitute an "
-        "operational forecast or official government guidance.",
-    )
+    pdf.multi_cell(0, 5, _latin1("DISCLAIMER: " + REPORT_DISCLAIMER))
     return bytes(pdf.output())
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# SESSION STATE + CSS HELPERS
-# ═════════════════════════════════════════════════════════════════════════════
+@st.cache_data(ttl=120, show_spinner=False)
+def build_payload_cached(sst, rainfall, drought, heat, crops, gw, irr, water, strategies, score) -> dict:
+    backend = get_backend()
+    results  = _emulate_cached(sst, rainfall, drought, heat, crops, gw, irr, water)
+    scenario = {"sst": sst, "rainfall": rainfall, "drought": drought, "heat": heat,
+                "adapt_dict": {"crops": crops, "gw": gw, "irr": irr, "water": water}}
+    top_strategy = {"strategies": list(strategies), "score": score}
+    payload = backend["build_payload"](scenario, results, top_strategy)
+    return payload if _validate_payload(payload) else _local_build_payload(scenario, results, top_strategy)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HOT-PATH COMPUTE  (cached emulator + policy comparison)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _emulate_cached(sst, rainfall, drought, heat, crops, gw, irr, water) -> dict:
+    emulator = get_backend()["emulator"]
+    return emulator(sst, rainfall, drought, heat, {"crops": crops, "gw": gw, "irr": irr, "water": water})
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _fallback_compare_combos(sst, rainfall, drought, heat) -> list:
+    emulator = get_backend()["emulator"]
+    rows = []
+    for c in range(16):
+        combo_keys = frozenset(k for bit, k in zip((1, 2, 4, 8), ORDERED_KEYS) if c & bit)
+        adapt = {k: int(k in combo_keys) for k in ORDERED_KEYS}
+        r = emulator(sst, rainfall, drought, heat, adapt)
+        rows.append(_normalize_combo(combo_keys, r["regional_resilience"]))
+    return sorted(rows, key=lambda x: x["score"], reverse=True)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _live_compare_cached(sst, rainfall, drought, heat) -> list:
+    backend  = get_backend()
+    scenario = {"sst": sst, "rainfall": rainfall, "drought": drought, "heat": heat}
+    return backend["compare"](scenario)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SESSION STATE + CSS
+# ═══════════════════════════════════════════════════════════════════════════
 
 def _init_session_state() -> None:
-    """Seed session_state with defaults on first run."""
     for key, val in SESSION_DEFAULTS.items():
         if key not in st.session_state:
             st.session_state[key] = val
 
 
 def _inject_css() -> None:
-    """Inject global theme CSS."""
-    st.markdown(
-        """
-        <style>
-        :root {
-            --color-primary:  #1a6b6b;
-            --color-normal:   #16a34a;
-            --color-elevated: #ca8a04;
-            --color-severe:   #ea580c;
-            --color-critical: #dc2626;
-        }
-        .stApp { background-color: #1A1A1A; }
-        section[data-testid="stSidebar"] { background-color: #1A1A1A; }
-        .crs-card {
-            background-color: #ffffff;
-            border-radius: 0.625rem;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.07);
-            padding: 1.1rem 1.4rem;
-            margin: 0.6rem 0 1rem 0;
-            border: 1px solid #e2e8f0;
-        }
-        .crs-header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            background-color: var(--color-primary);
-            border-radius: 0.625rem 0.625rem 0 0;
-            padding: 1.1rem 1.5rem;
-        }
-        .crs-header h1 {
-            color: #ffffff;
-            font-weight: 700;
-            font-size: 1.75rem;
-            margin: 0;
-            line-height: 1.2;
-        }
-        .crs-badge {
-            background-color: var(--color-normal);
-            color: #ffffff;
-            font-size: 0.85rem;
-            font-weight: 600;
-            padding: 0.35rem 0.9rem;
-            border-radius: 999px;
-            white-space: nowrap;
-        }
-        .crs-disclaimer {
-            background-color: #fef3c7;
-            color: #92400e;
-            font-size: 0.85rem;
-            font-style: italic;
-            padding: 0.6rem 1.5rem;
-            border-radius: 0 0 0.625rem 0.625rem;
-            border: 1px solid #fde68a;
-            margin-bottom: 1rem;
-        }
-        .crs-summary-climate {
-            font-size: 1.05rem;
-            font-weight: 600;
-            color: var(--color-primary);
-            margin-bottom: 0.4rem;
-        }
-        .crs-summary-adapt { font-size: 0.95rem; color: #334155; }
-        .crs-preset-pill {
-            display: inline-block;
-            background-color: var(--color-primary);
-            color: #ffffff;
-            font-size: 0.8rem;
-            font-weight: 600;
-            padding: 0.3rem 0.85rem;
-            border-radius: 999px;
-            margin-top: 0.6rem;
-        }
-        /* Preset buttons: color by sidebar column position */
-        section[data-testid="stSidebar"] div[data-testid="column"]:nth-of-type(1) button {
-            background-color: var(--color-normal); color: #ffffff; border: none;
-        }
-        section[data-testid="stSidebar"] div[data-testid="column"]:nth-of-type(2) button {
-            background-color: var(--color-severe); color: #ffffff; border: none;
-        }
-        section[data-testid="stSidebar"] div[data-testid="column"]:nth-of-type(3) button {
-            background-color: var(--color-critical); color: #ffffff; border: none;
-        }
-        section[data-testid="stSidebar"] div[data-testid="column"] button:hover {
-            filter: brightness(1.08); color: #ffffff;
-        }
-        #MainMenu {visibility: hidden;}
-        footer {visibility: hidden;}
-        header[data-testid="stHeader"] {background: transparent;}
-        html, body, [class*="css"] { font-size: 1rem; }
-        @media (max-width: 768px) {
-            [data-testid="column"] { min-width: 100% !important; margin-bottom: 0.5rem; }
-            h1 { font-size: 1.3rem !important; }
-            h2 { font-size: 1.1rem !important; }
-            .crs-card { padding: 10px !important; }
-            .stDownloadButton > button { width: 100% !important; }
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.markdown("""
+    <style>
+    :root {
+        --color-primary:  #1a6b6b;
+        --color-normal:   #16a34a;
+        --color-elevated: #ca8a04;
+        --color-severe:   #ea580c;
+        --color-critical: #dc2626;
+    }
+    .stApp { background-color: #ffffff; }
+    section[data-testid="stSidebar"] { background-color: #f0fdfa; }
+    html, body, [class*="css"] {
+        font-size: 1rem;
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+    }
+    .crs-card {
+        background:#ffffff; border-radius:.625rem;
+        box-shadow:0 2px 8px rgba(0,0,0,.07);
+        padding:1.1rem 1.4rem; margin:.6rem 0 1rem;
+        border:1px solid #e2e8f0;
+    }
+    .crs-header {
+        display:flex; align-items:center; justify-content:space-between;
+        background:var(--color-primary); border-radius:.625rem .625rem 0 0;
+        padding:1.1rem 1.5rem;
+    }
+    .crs-header h1 { color:#fff; font-weight:700; font-size:1.75rem; margin:0; line-height:1.2; }
+    .crs-badge {
+        background:var(--color-normal); color:#fff; font-size:.85rem;
+        font-weight:600; padding:.35rem .9rem; border-radius:999px; white-space:nowrap;
+    }
+    .crs-disclaimer {
+        background:#fef3c7; color:#92400e; font-size:.85rem; font-style:italic;
+        padding:.6rem 1.5rem; border-radius:0 0 .625rem .625rem;
+        border:1px solid #fde68a; margin-bottom:1rem;
+    }
+    .crs-summary-climate { font-size:1.05rem; font-weight:600; color:var(--color-primary); margin-bottom:.4rem; }
+    .crs-summary-adapt   { font-size:.95rem; color:#334155; }
+    .crs-preset-pill {
+        display:inline-block; background:var(--color-primary); color:#fff;
+        font-size:.8rem; font-weight:600; padding:.3rem .85rem;
+        border-radius:999px; margin-top:.6rem;
+    }
+    section[data-testid="stSidebar"] div[data-testid="column"]:nth-of-type(1) button
+        { background:var(--color-normal);   color:#fff; border:none; }
+    section[data-testid="stSidebar"] div[data-testid="column"]:nth-of-type(2) button
+        { background:var(--color-severe);   color:#fff; border:none; }
+    section[data-testid="stSidebar"] div[data-testid="column"]:nth-of-type(3) button
+        { background:var(--color-critical); color:#fff; border:none; }
+    section[data-testid="stSidebar"] div[data-testid="column"] button:hover
+        { filter:brightness(1.08); color:#fff; }
+    #MainMenu { visibility:hidden; }
+    footer    { visibility:hidden; }
+    header[data-testid="stHeader"] { background:transparent; }
+    .map-legend { margin-top:.5rem; }
+    @media (max-width:768px) {
+        [data-testid="column"] { min-width:100% !important; margin-bottom:.5rem; }
+        h1 { font-size:1.3rem !important; }
+        h2 { font-size:1.1rem !important; }
+        .crs-card { padding:10px !important; }
+        .crs-disclaimer { padding:.5rem .9rem !important; }
+        .map-legend { display:none !important; }
+        .stDownloadButton > button, .stButton > button { width:100% !important; min-height:40px !important; }
+        section[data-testid="stSidebar"] div[data-testid="column"] { min-width:100% !important; }
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
 # PRESET CALLBACKS
-# ═════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
 
-def _apply_preset(preset: dict, preset_name: str) -> None:
-    """on_click callback — loads preset values into session_state."""
+def _apply_preset(preset, preset_name):
     for key, val in preset.items():
         st.session_state[key] = val
     st.session_state["active_preset"] = preset_name
 
 
-def _reset_defaults() -> None:
-    """on_click callback — restores all controls to defaults."""
+def _reset_defaults():
     for key, val in SESSION_DEFAULTS.items():
         st.session_state[key] = val
     st.session_state["active_preset"] = "custom"
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# RANKING HELPER
-# ═════════════════════════════════════════════════════════════════════════════
-
-def _rank_all_combos(
-    emulator,
-    sst: float,
-    rainfall: float,
-    drought: float,
-    heat: float,
-) -> list:
-    """Evaluate all 16 adaptation combos; return list sorted by resilience desc."""
-    combos = []
-    for c in range(16):
-        combo = {
-            "crops": bool(c & 1),
-            "gw":    bool(c & 2),
-            "irr":   bool(c & 4),
-            "water": bool(c & 8),
-        }
-        r = emulator(sst, rainfall, drought, heat, {k: int(v) for k, v in combo.items()})
-        combos.append({
-            "combo": combo,
-            "score": r["regional_resilience"],
-            "adj":   r["adjusted_risk_score"],
-        })
-    return sorted(combos, key=lambda x: x["score"], reverse=True)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# STATUS-PILL HELPERS
-# ═════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
+# STATUS PILL HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
 
 def _status_higher_better(value: float) -> tuple:
-    """Status tier for metrics where higher = better (e.g. crop yield)."""
-    if value >= 70:
-        return "Normal",   "#16a34a"
-    if value >= 50:
-        return "Elevated", "#ca8a04"
-    if value >= 30:
-        return "Severe",   "#ea580c"
+    if value >= 70: return "Normal",   "#16a34a"
+    if value >= 50: return "Elevated", "#ca8a04"
+    if value >= 30: return "Severe",   "#ea580c"
     return "Critical", "#dc2626"
-
 
 def _status_gw_stress(value: float) -> tuple:
-    """FIX-4: Status tier for groundwater stress — lower is better (reversed scale)."""
-    if value <= 30:
-        return "Normal",   "#16a34a"
-    if value <= 50:
-        return "Elevated", "#ca8a04"
-    if value <= 69:
-        return "Severe",   "#ea580c"
+    if value <= 30: return "Normal",   "#16a34a"
+    if value <= 50: return "Elevated", "#ca8a04"
+    if value <= 69: return "Severe",   "#ea580c"
     return "Critical", "#dc2626"
-
 
 def _status_ag_risk(value: float) -> tuple:
-    """Status tier for agricultural risk on 0–5 scale (lower = better)."""
-    if value <= 1.5:
-        return "Normal",   "#16a34a"
-    if value <= 2.5:
-        return "Elevated", "#ca8a04"
-    if value <= 3.5:
-        return "Severe",   "#ea580c"
+    if value <= 1.5: return "Normal",   "#16a34a"
+    if value <= 2.5: return "Elevated", "#ca8a04"
+    if value <= 3.5: return "Severe",   "#ea580c"
+    return "Critical", "#dc2626"
+
+def _status_from_zscore(z: float, reversed_dir: bool) -> tuple:
+    """Z-score based status pill — consistent with IMD SPI thresholds."""
+    eff = _effective_z(z, reversed_dir)
+    if eff > Z_ELEVATED: return "Normal",   "#16a34a"
+    if eff > Z_SEVERE:   return "Elevated", "#ca8a04"
+    if eff > Z_CRITICAL: return "Severe",   "#ea580c"
     return "Critical", "#dc2626"
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# RENDER FUNCTIONS  (FIX-2: all UI here, called from main())
-# ═════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
+# RENDER FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════
 
 def render_sidebar(backend: dict) -> tuple:
-    """
-    Renders the sidebar controls and engine-source badge.
-    Returns (sst, rainfall, drought, heat, adapt_dict).
-    """
-    source = backend.get("source", "stub")
-    badge_map = {
-        "live":    "🟢 Live models",
-        "partial": "🟡 Partial (utils only)",
-        "stub":    "⚪ Stub mode",
-    }
+    source    = backend.get("source", "stub")
+    badge_map = {"live": "🟢 Live models", "partial": "🟡 Partial (utils only)", "stub": "⚪ Stub mode"}
 
     with st.sidebar:
         st.markdown("### 🌍 Climate Resilience Sandbox")
@@ -777,89 +985,42 @@ def render_sidebar(backend: dict) -> tuple:
         st.markdown("---")
 
         st.subheader("🌡️ Climate Scenario Inputs")
-
-        st.slider(
-            "Sea Surface Temperature Anomaly (°C)",
-            min_value=0.0, max_value=3.5, step=0.1,
-            key="sst_anomaly",
-            help="SST anomaly above baseline. >2.5°C = extreme El Niño.",
-        )
-        st.slider(
-            "Monsoon Rainfall Deficit (%)",
-            min_value=0, max_value=100, step=1,
-            key="rainfall_deficit",
-            help="Reduction in expected seasonal monsoon rainfall.",
-        )
-        st.slider(
-            "Drought Duration (months)",
-            min_value=0, max_value=12, step=1,
-            key="drought_months",
-            help="Consecutive months of below-normal rainfall.",
-        )
-        st.slider(
-            "Heat Stress Index (1–5)",
-            min_value=1, max_value=5, step=1,
-            key="heat_stress",
-            help="1=Mild  2=Low  3=Moderate  4=High  5=Extreme",
-        )
+        st.slider("Sea Surface Temperature Anomaly (°C)", 0.0, 3.5, step=0.1, key="sst_anomaly",
+                  help="SST anomaly above baseline. >2.5°C = extreme El Niño.")
+        st.slider("Monsoon Rainfall Deficit (%)",         0,   100, step=1,   key="rainfall_deficit",
+                  help="Reduction in expected seasonal monsoon rainfall.")
+        st.slider("Drought Duration (months)",            0,   12,  step=1,   key="drought_months",
+                  help="Consecutive months of below-normal rainfall.")
+        st.slider("Heat Stress Index (1–5)",              1,   5,   step=1,   key="heat_stress",
+                  help="1=Mild  2=Low  3=Moderate  4=High  5=Extreme")
 
         st.subheader("🌾 Adaptation Measures")
-        st.checkbox(
-            "Drought-Resistant Crop Program",
-            key="adapt_crops",
-            help="Short-cycle, drought-tolerant seed deployment.",
-        )
-        st.checkbox(
-            "Emergency Groundwater Rationing",
-            key="adapt_groundwater",
-            help="Volumetric water-use limits across irrigation zones.",
-        )
-        st.checkbox(
-            "Supplemental Irrigation Support",
-            key="adapt_irrigation",
-            help="Activate supplemental micro-irrigation infrastructure.",
-        )
-        st.checkbox(
-            "Water Conservation Initiative",
-            key="adapt_water",
-            help="Community rainwater harvesting and conservation.",
-        )
+        st.checkbox("Drought-Resistant Crop Program",  key="adapt_crops",       help="Short-cycle, drought-tolerant seed deployment.")
+        st.checkbox("Emergency Groundwater Rationing", key="adapt_groundwater", help="Volumetric water-use limits across irrigation zones.")
+        st.checkbox("Supplemental Irrigation Support", key="adapt_irrigation",  help="Activate supplemental micro-irrigation infrastructure.")
+        st.checkbox("Water Conservation Initiative",   key="adapt_water",       help="Community rainwater harvesting and conservation.")
 
         st.subheader("🚀 Quick Presets")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.button(
-                "🌤 Moderate", use_container_width=True,
-                on_click=_apply_preset, args=(MODERATE_EL_NINO, "moderate_el_nino"),
-            )
-        with col2:
-            st.button(
-                "🔥 Severe", use_container_width=True,
-                on_click=_apply_preset, args=(SEVERE_DROUGHT, "severe_drought"),
-            )
-        with col3:
-            st.button(
-                "⚡ Extreme", use_container_width=True,
-                on_click=_apply_preset, args=(EXTREME_ENSO, "extreme_enso"),
-            )
-
+        c1, c2, c3 = st.columns(3)
+        with c1: st.button("🌤 Moderate", use_container_width=True, on_click=_apply_preset, args=(MODERATE_EL_NINO, "moderate_el_nino"))
+        with c2: st.button("🔥 Severe",   use_container_width=True, on_click=_apply_preset, args=(SEVERE_DROUGHT,   "severe_drought"))
+        with c3: st.button("⚡ Extreme",  use_container_width=True, on_click=_apply_preset, args=(EXTREME_ENSO,     "extreme_enso"))
         st.button("↺ Reset to Default", use_container_width=True, on_click=_reset_defaults)
 
+        st.markdown("---")
+        st.checkbox("📱 Compact mode", key="compact_mode",
+                    help="Stacks map and recommendations full-width, shrinks charts. Good for mobile.")
+
         with st.expander("ℹ️ About this tool"):
-            st.markdown(
-                """
-                **AI Climate Resilience Sandbox** is a web-based decision-support
-                platform for exploring extreme El Niño–Southern Oscillation (ENSO)
-                climate scenarios and comparing adaptation strategies.
+            st.markdown("""
+                **AI Climate Resilience Sandbox** is a web-based decision-support platform
+                for exploring extreme ENSO climate scenarios and comparing adaptation strategies.
 
                 **Target users:** District administrators, agricultural cooperatives,
                 water management boards, rural development agencies, and climate NGOs.
 
-                **Note:** This platform is for scenario planning only. It does not
-                provide authoritative forecasts and should not replace operational
-                weather or emergency-management guidance.
-                """
-            )
+                **Note:** Scenario planning only — not an operational forecast.
+            """)
 
     adapt_dict = {
         "crops": int(st.session_state.adapt_crops),
@@ -867,19 +1028,12 @@ def render_sidebar(backend: dict) -> tuple:
         "irr":   int(st.session_state.adapt_irrigation),
         "water": int(st.session_state.adapt_water),
     }
-    return (
-        st.session_state.sst_anomaly,
-        st.session_state.rainfall_deficit,
-        st.session_state.drought_months,
-        st.session_state.heat_stress,
-        adapt_dict,
-    )
+    return (st.session_state.sst_anomaly, st.session_state.rainfall_deficit,
+            st.session_state.drought_months, st.session_state.heat_stress, adapt_dict)
 
 
 def render_header() -> None:
-    """Renders the teal header banner and amber disclaimer bar."""
-    st.markdown(
-        """
+    st.markdown("""
         <div class="crs-header">
             <h1>🌍&nbsp; AI Climate Resilience Sandbox</h1>
             <span class="crs-badge">SDG 13: Climate Action</span>
@@ -888,433 +1042,195 @@ def render_header() -> None:
             ⚠️ Decision-support tool only — not an operational forecast.
             All results are exploratory scenario estimates.
         </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    """, unsafe_allow_html=True)
 
 
-def render_scenario_summary(
-    sst: float,
-    rainfall: float,
-    drought: float,
-    heat: float,
-    adapt_dict: dict,
-) -> None:
-    """Renders the scenario summary bar below the header."""
-    climate_desc = (
-        f"SST +{sst}°C  |  "
-        f"{rainfall}% Rainfall Deficit  |  "
-        f"{drought} Month Drought  |  "
-        f"Heat Level {heat}/5"
-    )
-    active_adaptations = [
-        name
-        for name, key in {
-            "Drought-Resistant Crops": "crops",
-            "Groundwater Rationing":   "gw",
-            "Supplemental Irrigation": "irr",
-            "Water Conservation":      "water",
-        }.items()
-        if adapt_dict.get(key)
-    ]
-    adapt_desc = (
-        "Adaptations Active: " + ", ".join(active_adaptations)
-        if active_adaptations
-        else "⚠️ No adaptation measures active"
-    )
-    preset_html = ""
+def render_scenario_summary(sst, rainfall, drought, heat, adapt_dict) -> None:
+    climate_desc = f"SST +{sst}°C  |  {rainfall}% Rainfall Deficit  |  {drought} Month Drought  |  Heat Level {heat}/5"
+    active = [name for name, key in {
+        "Drought-Resistant Crops": "crops", "Groundwater Rationing": "gw",
+        "Supplemental Irrigation": "irr",   "Water Conservation":    "water",
+    }.items() if adapt_dict.get(key)]
+    adapt_desc   = "Adaptations Active: " + ", ".join(active) if active else "⚠️ No adaptation measures active"
+    preset_html  = ""
     if st.session_state["active_preset"] != "custom":
         label = PRESET_LABELS.get(st.session_state["active_preset"], "Custom")
         preset_html = f'<div class="crs-preset-pill">Preset: {label}</div>'
-
-    st.markdown(
-        f"""
+    st.markdown(f"""
         <div class="crs-card">
             <div class="crs-summary-climate">📋&nbsp; {climate_desc}</div>
             <div class="crs-summary-adapt">{adapt_desc}</div>
             {preset_html}
         </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    """, unsafe_allow_html=True)
 
 
-def render_status_alerts(adj: float, policy_rules: dict, ood: bool) -> None:
-    """
-    Renders OOD warning (if triggered) then the risk-level status alert.
-    Uses RISK_NORMAL / RISK_ELEVATED / RISK_SEVERE module constants (FIX-1).
-    Always rendered ABOVE the metric cards.
-    """
-    if ood:
-        st.error(
-            "⚠️ Out-of-Distribution Warning: One or more parameters exceed "
-            "the model's historical training range (1991–2017). Results are "
-            "exploratory estimates only — interpret with caution."
-        )
-    def _get_desc(rules, key):
-        entry = rules.get(key, {})
-        if isinstance(entry, dict):
-            return entry.get("description", "")
-        return str(entry)
-
+def render_status_alerts(adj, policy_rules, ood_warnings) -> None:
+    for w in ood_warnings:
+        st.error("⚠️ " + w)
     if adj >= RISK_SEVERE:
-        st.error("🔴 Critical Resource Alert — " + _get_desc(policy_rules, "critical"))
+        st.error("🔴 Critical Resource Alert — "   + _policy_guidance(policy_rules, "critical"))
     elif adj >= RISK_ELEVATED:
-        st.warning("🟠 Severe Stress — " + _get_desc(policy_rules, "severe"))
+        st.warning("🟠 Severe Stress — "           + _policy_guidance(policy_rules, "severe"))
     elif adj >= RISK_NORMAL:
-        st.warning("🟡 Elevated Risk — " + _get_desc(policy_rules, "elevated"))
+        st.warning("🟡 Elevated Risk — "           + _policy_guidance(policy_rules, "elevated"))
     else:
-        st.success("🟢 Normal Conditions — " + _get_desc(policy_rules, "normal"))
+        st.success("🟢 Normal Conditions — "       + _policy_guidance(policy_rules, "normal"))
 
 
-def render_metric_cards(results: dict, baseline: dict, hist_stats: dict, backend: dict) -> None:
+def render_metric_cards(results, baseline, hist_stats, backend) -> None:
     st.subheader("📊 Key Resilience Indicators")
-
     zscore_fn = backend["zscore"]
 
     METRIC_DEFS = [
-        {
-            "label":       "🌾 Crop Yield Stability",
-            "result_key":  "crop_yield_stability",
-            "stats_key":   "crop_yield_stability_ui",
-            "unit":        "%",
-            "delta_color": "normal",
-            "reversed":    False,
-        },
-        {
-            "label":       "💧 Water Reservoir Security",
-            "result_key":  "water_reservoir_security",
-            "stats_key":   "water_reservoir_security_ui",
-            "unit":        "%",
-            "delta_color": "normal",
-            "reversed":    False,
-        },
-        {
-            "label":       "🏜 Groundwater Stress",
-            "result_key":  "groundwater_stress",
-            "stats_key":   "groundwater_stress_ui",
-            "unit":        "%",
-            "delta_color": "inverse",
-            "reversed":    True,
-        },
-        {
-            "label":       "⚠️ Agricultural Risk Exposure",
-            "result_key":  "agricultural_risk",
-            "stats_key":   "agricultural_risk_ui",
-            "unit":        "/ 5.0",
-            "delta_color": "inverse",
-            "reversed":    True,
-        },
-        {
-            "label":       "🛡 Regional Resilience Score",
-            "result_key":  "regional_resilience",
-            "stats_key":   "regional_resilience",
-            "unit":        "%",
-            "delta_color": "normal",
-            "reversed":    False,
-        },
+        {"label": "🌾 Crop Yield Stability",       "result_key": "crop_yield_stability",     "stats_key": "crop_yield_stability_ui",     "unit": "%",     "delta_color": "normal",  "reversed": False},
+        {"label": "💧 Water Reservoir Security",   "result_key": "water_reservoir_security", "stats_key": "water_reservoir_security_ui", "unit": "%",     "delta_color": "normal",  "reversed": False},
+        {"label": "🏜 Groundwater Stress",         "result_key": "groundwater_stress",       "stats_key": "groundwater_stress_ui",       "unit": "%",     "delta_color": "inverse", "reversed": True},
+        {"label": "⚠️ Agricultural Risk Exposure", "result_key": "agricultural_risk",        "stats_key": "agricultural_risk_ui",        "unit": "/ 5.0", "delta_color": "inverse", "reversed": True},
+        {"label": "🛡 Regional Resilience Score",   "result_key": "regional_resilience",      "stats_key": "regional_resilience",         "unit": "%",     "delta_color": "normal",  "reversed": False},
     ]
-
-    def _status_from_zscore(z: float, reversed_dir: bool) -> tuple:
-        effective = -z if reversed_dir else z
-        if effective > -0.5:
-            return "Normal",   "#16a34a"
-        if effective > -1.0:
-            return "Elevated", "#ca8a04"
-        if effective > -1.5:
-            return "Severe",   "#ea580c"
-        return "Critical",     "#dc2626"
 
     with st.container(border=True):
         cols = st.columns(5)
         for col, m in zip(cols, METRIC_DEFS):
-            value    = results[m["result_key"]]
-            base     = baseline[m["result_key"]]
-            delta    = value - base
-            stats    = hist_stats.get(m["stats_key"], {"mean": 0, "std": 1})
-            z        = zscore_fn(value, stats["mean"], stats["std"])
-            status_label, status_color = _status_from_zscore(z, m["reversed"])
-
+            value  = results[m["result_key"]]
+            base   = baseline[m["result_key"]]
+            delta  = value - base
+            stats  = hist_stats.get(m["stats_key"], {"mean": 0, "std": 1})
+            z      = zscore_fn(value, stats["mean"], stats["std"])
+            label, color = _status_from_zscore(z, m["reversed"])
             with col:
-                st.metric(
-                    label=m["label"],
-                    value=f"{value}{m['unit']}",
-                    delta=f"{delta:+.1f}{m['unit']}",
-                    delta_color=m["delta_color"],
-                )
+                st.metric(label=m["label"], value=f"{value}{m['unit']}",
+                          delta=f"{delta:+.1f}{m['unit']}", delta_color=m["delta_color"])
                 st.markdown(
-                    f'<span style="background:{status_color};color:white;'
-                    f'padding:2px 10px;border-radius:12px;font-size:0.75rem;'
-                    f'font-weight:600;">{status_label}</span>',
+                    f'<span style="background:{color};color:white;padding:2px 10px;'
+                    f'border-radius:12px;font-size:.75rem;font-weight:600;">{label}</span>',
                     unsafe_allow_html=True,
                 )
 
-def render_risk_map(adj: float) -> None:
-    """Renders the interactive district risk map (or treemap fallback)."""
+
+def render_risk_map(adj, height=MAP_HEIGHT) -> None:
     st.subheader("📍 Regional Risk Distribution")
-
-    DISTRICTS = [
-    {"name": "Kanchipuram",      "lat": 12.83, "lon": 79.70},
-    {"name": "Cuddalore",        "lat": 11.75, "lon": 79.77},
-    {"name": "Vellore",          "lat": 12.92, "lon": 79.13},
-    {"name": "Salem",            "lat": 11.67, "lon": 78.15},
-    {"name": "Coimbatore",       "lat": 11.01, "lon": 76.97},
-    {"name": "Tiruchirappalli",  "lat": 10.79, "lon": 78.70},
-    {"name": "Thanjavur",        "lat": 10.79, "lon": 79.14},
-    {"name": "Madurai",          "lat":  9.93, "lon": 78.12},
-    {"name": "Ramanathapuram",   "lat":  9.37, "lon": 78.83},
-    {"name": "Tirunelveli",      "lat":  8.73, "lon": 77.70},
-    {"name": "The Nilgiris",     "lat": 11.49, "lon": 76.73},
-    {"name": "Kanyakumari",      "lat":  8.09, "lon": 77.55},
-]
-    OFFSETS = [0.10, -0.12, 0.08, -0.15, 0.05, -0.09, 0.13, -0.07, 0.11, -0.10, 0.06, -0.08]
-    COLOR_MAP = {
-        "Normal":         "#16a34a",
-        "Elevated Risk":  "#ca8a04",
-        "Severe Stress":  "#ea580c",
-        "Critical Alert": "#dc2626",
-    }
-
+    COLOR_MAP = {"Normal": "#16a34a", "Elevated Risk": "#ca8a04", "Severe Stress": "#ea580c", "Critical Alert": "#dc2626"}
     rows = []
     for i, d in enumerate(DISTRICTS):
-        risk_i = max(0.0, min(1.0, adj + OFFSETS[i]))
-        if risk_i >= RISK_SEVERE:
-            label_i = "Critical Alert"
-        elif risk_i >= RISK_ELEVATED:
-            label_i = "Severe Stress"
-        elif risk_i >= RISK_NORMAL:
-            label_i = "Elevated Risk"
-        else:
-            label_i = "Normal"
-        rows.append({
-            "District":             d["name"],
-            "lat":                  d["lat"],
-            "lon":                  d["lon"],
-            "Risk Level":           label_i,
-            "Resilience Score (%)": round((1 - risk_i) * 100, 1),
-            "size":                 18,
-        })
-
+        risk_i = max(0.0, min(1.0, adj + DISTRICT_OFFSETS[i]))
+        if risk_i >= RISK_SEVERE:   label_i = "Critical Alert"
+        elif risk_i >= RISK_ELEVATED: label_i = "Severe Stress"
+        elif risk_i >= RISK_NORMAL:   label_i = "Elevated Risk"
+        else:                         label_i = "Normal"
+        rows.append({"District": d["name"], "lat": d["lat"], "lon": d["lon"],
+                     "Risk Level": label_i, "Resilience Score (%)": round((1 - risk_i) * 100, 1), "size": 18})
     map_df = pd.DataFrame(rows)
-
     try:
-        fig_map = px.scatter_map(
-            map_df, lat="lat", lon="lon",
-            color="Risk Level",
-            color_discrete_map=COLOR_MAP,
-            size="size", size_max=18,
-            hover_name="District",
-            hover_data={
-                "Risk Level": True,
-                "Resilience Score (%)": True,
-                "lat": False, "lon": False, "size": False,
-            },
-            zoom=6,  # was 5
-            center={"lat": 10.5, "lon": 78.5},
-            height=420,
+        fig = px.scatter_map(
+            map_df, lat="lat", lon="lon", color="Risk Level", color_discrete_map=COLOR_MAP,
+            size="size", size_max=18, hover_name="District",
+            hover_data={"Risk Level": True, "Resilience Score (%)": True, "lat": False, "lon": False, "size": False},
+            zoom=6, center={"lat": 10.5, "lon": 78.5}, height=height,
         )
-        fig_map.update_layout(
-            map_style="carto-positron",
-            margin={"l": 0, "r": 0, "t": 0, "b": 0},
-            legend_title_text="Risk Level",
-        )
-        # FIX-3: displayModeBar: False on all charts
-        st.plotly_chart(
-            fig_map,
-            use_container_width=True,
-            config={"scrollZoom": True, "displayModeBar": False, "displaylogo": False},
-            key="risk_map",
-        )
+        fig.update_layout(map_style="carto-positron", margin={"l":0,"r":0,"t":0,"b":0}, legend_title_text="Risk Level")
+        st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG, key="risk_map")
     except Exception:  # noqa: BLE001
-        fig_tree = px.treemap(
-            map_df,
-            path=["District"],
-            values=[1] * len(map_df),
-            color="Resilience Score (%)",
-            color_continuous_scale=["#dc2626", "#ca8a04", "#16a34a"],
-            hover_data={"Risk Level": True, "Resilience Score (%)": True},
-            height=420,
-        )
-        fig_tree.update_layout(margin={"l": 0, "r": 0, "t": 0, "b": 0})
-        st.plotly_chart(
-            fig_tree,
-            use_container_width=True,
-            config={"displayModeBar": False, "displaylogo": False},  # FIX-3
-            key="risk_map",
-        )
-
-    st.markdown(
-        "🟢 Normal&nbsp;&nbsp; 🟡 Elevated Risk&nbsp;&nbsp; "
-        "🟠 Severe Stress&nbsp;&nbsp; 🔴 Critical Alert"
-    )
+        fig = px.treemap(map_df, path=["District"], values=[1]*len(map_df),
+                         color="Resilience Score (%)", color_continuous_scale=["#dc2626","#ca8a04","#16a34a"],
+                         hover_data={"Risk Level": True, "Resilience Score (%)": True}, height=height)
+        fig.update_layout(margin={"l":0,"r":0,"t":0,"b":0})
+        st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG, key="risk_map")
+    st.markdown("<div class='map-legend'>🟢 Normal&nbsp;&nbsp; 🟡 Elevated Risk&nbsp;&nbsp; 🟠 Severe Stress&nbsp;&nbsp; 🔴 Critical Alert</div>", unsafe_allow_html=True)
 
 
-def render_recommendations(adapt_dict: dict, all_combos: list) -> None:
-    """Renders the top-3 ranked strategy recommendation cards."""
+def render_recommendations(adapt_dict, all_combos) -> None:
     st.subheader("🏆 Recommended Strategies")
-
-    STRATEGY_DESCRIPTIONS = {
-        frozenset(["crops", "water"]):
-            "Reduces crop failure while preserving groundwater. "
-            "Effective for moderate droughts.",
-        frozenset(["crops", "gw", "irr", "water"]):
-            "Maximum resilience. Requires significant coordination "
-            "and resources across all sectors.",
-        frozenset(["gw", "irr"]):
-            "Balances short-term water access with long-term aquifer health.",
-        frozenset(["crops", "gw"]):
-            "Cost-effective pairing for early-stage drought response.",
-        frozenset(["irr", "water"]):
-            "Strong for water security; moderate crop protection.",
-    }
-    DEFAULT_DESC = (
-        "Moderate improvement. Consider pairing with additional measures "
-        "for stronger outcomes."
-    )
     RANK_BADGES = ["🥇", "🥈", "🥉"]
     RANK_LABELS = ["Best Strategy", "Runner-Up", "Third Option"]
-
     active_keys = frozenset(k for k, v in adapt_dict.items() if v)
-    top3 = all_combos[:3]
 
-    for i, item in enumerate(top3):
-        active_in_combo = [STRATEGY_NAMES[k] for k, v in item["combo"].items() if v]
-        combo_keys = frozenset(k for k, v in item["combo"].items() if v)
-        desc = STRATEGY_DESCRIPTIONS.get(combo_keys, DEFAULT_DESC)
-        is_active = combo_keys == active_keys
-
+    for i, item in enumerate(all_combos[:3]):
+        combo_keys = item["combo_keys"]
+        strategies = item["strategies"]
+        desc       = item.get("description") or STRATEGY_DESCRIPTIONS.get(combo_keys, DEFAULT_STRATEGY_DESC)
+        is_active  = combo_keys == active_keys
         border = "3px solid #0d9488" if is_active else "1px solid #ccfbf1"
         bg     = "#f0fdfa"          if is_active else "#ffffff"
-
-        chips = "  ".join(
-            f'<span style="background:#dcfce7;color:#166534;'
-            f'padding:2px 8px;border-radius:10px;font-size:0.75rem;">'
-            f'✅ {s}</span>'
-            for s in (active_in_combo or ["No measures"])
+        chips  = "  ".join(
+            f'<span style="background:#dcfce7;color:#166534;padding:2px 8px;border-radius:10px;font-size:.75rem;">✅ {s}</span>'
+            for s in (strategies or ["No measures"])
         )
-        active_note = (
-            "<div style='color:#0d9488;font-size:0.75rem;'>← Currently Active</div>"
-            if is_active else ""
-        )
-
-        st.markdown(
-            f"""
-            <div style="border:{border};background:{bg};border-radius:10px;
-                        padding:12px 14px;margin-bottom:12px;">
-              <div style="font-size:1.1rem;font-weight:700;color:#1a6b6b;">
-                {RANK_BADGES[i]} {RANK_LABELS[i]}
-              </div>
+        active_note = "<div style='color:#0d9488;font-size:.75rem;'>← Currently Active</div>" if is_active else ""
+        st.markdown(f"""
+            <div style="border:{border};background:{bg};border-radius:10px;padding:12px 14px;margin-bottom:12px;">
+              <div style="font-size:1.1rem;font-weight:700;color:#1a6b6b;">{RANK_BADGES[i]} {RANK_LABELS[i]}</div>
               <div style="margin:6px 0;">{chips}</div>
-              <div style="color:#374151;font-size:0.85rem;">{desc}</div>
-              <div style="color:#1a6b6b;font-weight:600;margin-top:6px;">
-                Resilience Score: {item["score"]}%
-              </div>
+              <div style="color:#374151;font-size:.85rem;">{desc}</div>
+              <div style="color:#0d9488;font-weight:600;margin-top:6px;">Resilience Score: {item["score"]}%</div>
               {active_note}
             </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        """, unsafe_allow_html=True)
 
 
-def render_radar_chart(results: dict, baseline: dict) -> None:
-    """Renders the resilience radar chart (with vs. without adaptations)."""
+def render_radar_chart(results, baseline, height=RADAR_HEIGHT) -> None:
     st.subheader("📈 Resilience Profile — With vs. Without Adaptations")
-
-    categories = [
-        "Crop Yield Stability",
-        "Water Security",
-        "Groundwater Health",
-        "Low Agricultural Risk",
-        "Regional Resilience",
-    ]
-    with_vals = [
-        results["crop_yield_stability"],
-        results["water_reservoir_security"],
-        100 - results["groundwater_stress"],
-        100 - (results["agricultural_risk"] / 5 * 100),
-        results["regional_resilience"],
-    ]
-    without_vals = [
-        baseline["crop_yield_stability"],
-        baseline["water_reservoir_security"],
-        100 - baseline["groundwater_stress"],
-        100 - (baseline["agricultural_risk"] / 5 * 100),
-        baseline["regional_resilience"],
-    ]
-
+    categories = ["Crop Yield Stability", "Water Security", "Groundwater Health", "Low Agricultural Risk", "Regional Resilience"]
+    with_vals    = [results["crop_yield_stability"],  results["water_reservoir_security"],
+                    100 - results["groundwater_stress"],  100 - (results["agricultural_risk"] / 5 * 100),  results["regional_resilience"]]
+    without_vals = [baseline["crop_yield_stability"], baseline["water_reservoir_security"],
+                    100 - baseline["groundwater_stress"], 100 - (baseline["agricultural_risk"] / 5 * 100), baseline["regional_resilience"]]
     fig = go.Figure()
-    fig.add_trace(go.Scatterpolar(
-        r=without_vals + [without_vals[0]],
-        theta=categories + [categories[0]],
-        fill="toself",
-        name="Without Adaptations",
-        line={"color": "#f97316", "dash": "dash"},
-        fillcolor="rgba(249,115,22,0.1)",
-    ))
-    fig.add_trace(go.Scatterpolar(
-        r=with_vals + [with_vals[0]],
-        theta=categories + [categories[0]],
-        fill="toself",
-        name="With Current Adaptations",
-        line={"color": "#0d9488"},
-        fillcolor="rgba(13,148,136,0.15)",
-    ))
-    fig.update_layout(
-        polar={
-            "radialaxis": {"visible": True, "range": [0, 100], "ticksuffix": "%"},
-            "angularaxis": {"rotation": 90},
-        },
-        showlegend=True,
-        paper_bgcolor="rgba(0,0,0,0)",
-        height=380,
-        margin={"l": 40, "r": 40, "t": 40, "b": 40},
-    )
-    # FIX-3: displayModeBar: False
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    fig.add_trace(go.Scatterpolar(r=without_vals+[without_vals[0]], theta=categories+[categories[0]],
+                                  fill="toself", name="Without Adaptations",
+                                  line={"color":"#f97316","dash":"dash"}, fillcolor="rgba(249,115,22,.1)"))
+    fig.add_trace(go.Scatterpolar(r=with_vals+[with_vals[0]], theta=categories+[categories[0]],
+                                  fill="toself", name="With Current Adaptations",
+                                  line={"color":"#0d9488"}, fillcolor="rgba(13,148,136,.15)"))
+    fig.update_layout(polar={"radialaxis":{"visible":True,"range":[0,100],"ticksuffix":"%"},"angularaxis":{"rotation":90}},
+                      showlegend=True, paper_bgcolor="rgba(0,0,0,0)", height=height,
+                      margin={"l":40,"r":40,"t":40,"b":40})
+    st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
 
 
-def render_zscore_panel(results: dict, hist_stats: dict, backend: dict) -> None:
-    st.subheader("📐 Z-Score Risk Thresholds")
-
-    ZSCORE_META = {
-        "crop_yield_stability":     ("🌾 Crop Yield Stability",    "%",     False, "crop_yield_stability_ui"),
-        "water_reservoir_security": ("💧 Water Reservoir Security", "%",     False, "water_reservoir_security_ui"),
-        "groundwater_stress":       ("🏜 Groundwater Stress",       "%",     True,  "groundwater_stress_ui"),
-        "agricultural_risk":        ("⚠️ Agricultural Risk",        "/ 5.0", True,  "agricultural_risk_ui"),
-        "regional_resilience":      ("🛡 Regional Resilience",      "%",     False, "regional_resilience"),
-    }
-
-    def _directive_for_z(z: float, reversed_dir: bool) -> str:
-        effective = -z if reversed_dir else z
-        if effective < -1.5:
-            return "🔴 Critical — Emergency Response Recommended"
-        if effective < -1.0:
-            return "🟠 Severe Stress — Immediate Action Required"
-        if effective < -0.5:
-            return "🟡 Elevated Risk — Enhanced Monitoring"
-        return "🟢 Normal Operating Range"
-
+def render_zscore_panel(results, hist_stats, backend, policy_rules) -> None:
+    st.subheader("📐 Z-Score Risk Thresholds & Directive Routing")
     zscore_fn = backend["zscore"]
-    rows = []
-    for result_key, (display_name, unit, reversed_dir, stats_key) in ZSCORE_META.items():
-        value = results[result_key]
-        stats = hist_stats.get(stats_key, {"mean": 0, "std": 1, "min": 0, "max": 100})
-        z = zscore_fn(value, stats["mean"], stats["std"])
-        rows.append({
-            "Indicator":     display_name,
-            "Current Value": f"{value}{unit}",
-            "Hist. Mean":    f"{round(stats['mean'], 2)}{unit}",
-            "Z-Score":       round(z, 4),
-            "Directive":     _directive_for_z(z, reversed_dir),
-        })
+    rows  = []
+    worst = None  # (effective_z, display_name, directive)
 
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    for result_key, (display_name, unit, reversed_dir, stats_key) in ZSCORE_META.items():
+        value  = results[result_key]
+        stats  = hist_stats.get(stats_key, MOCK_STATS.get(stats_key, {"mean": 0, "std": 1}))
+        z      = round(float(zscore_fn(value, stats["mean"], stats["std"])), 2)
+        direct = classify_directive(z, reversed_dir)
+        eff    = _effective_z(z, reversed_dir)
+        rows.append({"Indicator": display_name, "Current Value": f"{value}{unit}",
+                     "Hist. Mean": f"{round(stats['mean'],2)}{unit}", "Z-Score": z, "Directive": direct})
+        if worst is None or eff < worst[0]:
+            worst = (eff, display_name, direct)
+
+    df = pd.DataFrame(rows)
+    styled = df.style.map(_directive_cell_style, subset=["Directive"])
+    st.dataframe(styled, use_container_width=True, hide_index=True)
     st.caption(
-        "Z-score indicates standard deviations from the 27-year historical mean (1991–2017). "
-        "IMD SPI-based thresholds: Normal > -0.5, Elevated > -1.0, Severe > -1.5, Critical ≤ -1.5."
+        "Z-score = standard deviations from the 1991–2017 historical mean. "
+        "IMD SPI-based bands: Normal > −0.5 · Elevated > −1.0 · Severe > −1.5 · Critical ≤ −1.5 "
+        "(sign reversed for Groundwater Stress & Agricultural Risk)."
     )
 
-def render_transparency(results: dict, ood: bool, hist_stats: dict) -> None:
+    if worst is not None:
+        _, worst_name, worst_directive = worst
+        color    = DIRECTIVE_COLORS.get(worst_directive, "#1a6b6b")
+        category = DIRECTIVE_POLICY_KEY.get(worst_directive, "normal")
+        guidance = _policy_guidance(policy_rules, category)
+        st.markdown(f"""
+            <div style="border-left:6px solid {color};background:#f8fafc;border-radius:8px;padding:12px 16px;margin-top:10px;">
+              <div style="font-size:.8rem;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.05em;">📌 Active Directive</div>
+              <div style="font-size:1.05rem;font-weight:700;color:{color};margin:4px 0;">{worst_directive}</div>
+              <div style="font-size:.85rem;color:#475569;margin-bottom:6px;">Triggered by worst indicator: <strong>{worst_name}</strong></div>
+              <div style="font-size:.9rem;color:#1f2937;">{guidance}</div>
+            </div>
+        """, unsafe_allow_html=True)
+
+
+def render_transparency(results, ood_warnings, hist_stats) -> None:
     with st.expander("🔍 Transparency & Model Confidence", expanded=False):
         t1, t2, t3 = st.columns(3)
 
@@ -1329,203 +1245,194 @@ def render_transparency(results: dict, ood: bool, hist_stats: dict) -> None:
             }
             conf_rows = []
             for name, (result_key, stats_key, default_range) in INDICATOR_RANGES.items():
-                stats = hist_stats.get(stats_key, {"mean": 0, "std": 1, "min": 0, "max": 100})
-                conf_rows.append({
-                    "Indicator":  name,
-                    "Estimate":   results[result_key],
-                    "± Range":    default_range,
-                    "Hist. Mean": round(stats["mean"], 2),
-                })
+                stats = hist_stats.get(stats_key, {"mean": 0, "std": 1})
+                conf_rows.append({"Indicator": name, "Estimate": results[result_key],
+                                  "± Range": default_range, "Hist. Mean": round(stats["mean"], 2)})
             st.dataframe(pd.DataFrame(conf_rows), use_container_width=True, hide_index=True)
-
             if hist_stats.get("_using_mock", False):
-                st.caption(
-                    "⚠️ Some statistics using fallback values. "
-                    "Check data/historical_statistics.json."
-                )
+                st.caption("⚠️ Some statistics using fallback values (check data/historical_statistics.json).")
             else:
                 st.caption("✅ Statistics loaded from real dataset (1991–2017).")
 
         with t2:
             st.markdown("**🤖 Model Information**")
-            st.markdown(
-                """
+            st.markdown("""
                 - **Model:** Random Forest Regressor (Surrogate Emulator)
                 - **Training period:** 1991–2017 (27 years)
-                - **Features:** ONI (DJF), Rainfall JJAS,
-                  Rainfall OND, Reservoir Storage %,
-                  Year, Groundnut Yield
+                - **Features:** ONI (DJF), Rainfall JJAS, Rainfall OND,
+                  Reservoir Storage %, Year, Groundnut Yield
                 - **Crop model R²:** 0.52
                 - **Water model R²:** 0.83
-                - **Targets:** Crop Yield, Water Security
-                - **Last updated:** June 2025
-                - **Limitations:** Cannot account for sudden
-                  geopolitical or infrastructure shocks.
-                """
-            )
+                - **Data sources:** NOAA ONI, IMD Rainfall, ICRISAT Crop Data, CWC Reservoir Data
+                - **Limitations:** Crop yield plateaus under extreme scenarios
+                  (Random Forest leaf node behaviour, n=27). Cannot account for
+                  sudden geopolitical or infrastructure shocks.
+            """)
 
         with t3:
             st.markdown("**⚠️ Distribution Check**")
-            if ood:
-                st.error(
-                    "**Out-of-Distribution Scenario**  \n"
-                    "Parameters exceed historical training range.  \n"
-                    "Results are exploratory estimates only."
-                )
+            if ood_warnings:
+                for w in ood_warnings:
+                    st.error(w)
             else:
                 st.success("✅ All parameters within historical training range (1991–2017).")
-            st.markdown(
-                """
+            st.markdown("""
                 **Data Coverage:**
                 Region: Tamil Nadu, India
-                Source: NOAA ONI, IMD Rainfall, ICRISAT
-                        Crop Data, CWC Reservoir Data
+                Source: NOAA ONI, IMD Rainfall,
+                        ICRISAT Crop Data, CWC Reservoir Data
                 Boundary: 1991–2017 annual observations
-                """
-            )
+            """)
 
 
-def render_export(
-    scenario_data: dict,
-    results: dict,
-    all_combos: list,
-    ood: bool,
-) -> None:
-    """Renders the export action-briefing section."""
+def render_export(scenario_data, all_combos) -> None:
     st.divider()
     st.subheader("📄 Export Action Briefing")
+    top    = all_combos[0]
+    adapt  = scenario_data["adapt_dict"]
+    payload = build_payload_cached(
+        scenario_data["sst"], scenario_data["rainfall"],
+        scenario_data["drought"], scenario_data["heat"],
+        adapt["crops"], adapt["gw"], adapt["irr"], adapt["water"],
+        tuple(top["strategies"]), top["score"],
+    )
+    txt_content = payload_to_txt(payload)
+    csv_bytes   = payload_to_csv(payload)
 
-    top = all_combos[0]
-    top_strategy = {
-        "strategies": [STRATEGY_NAMES[k] for k, v in top["combo"].items() if v],
-        "score":      top["score"],
-    }
-
-    txt_content = generate_txt_report(scenario_data, results, top_strategy, ood)
-
-    csv_df = pd.DataFrame([{
-        "SST_Anomaly_C":        scenario_data["sst"],
-        "Rainfall_Deficit_pct": scenario_data["rainfall"],
-        "Drought_Months":       scenario_data["drought"],
-        "Heat_Stress":          scenario_data["heat"],
-        "Crop_Yield_Stability": results["crop_yield_stability"],
-        "Water_Security":       results["water_reservoir_security"],
-        "Groundwater_Stress":   results["groundwater_stress"],
-        "Agricultural_Risk":    results["agricultural_risk"],
-        "Regional_Resilience":  results["regional_resilience"],
-    }])
+    with st.expander("👁 Report preview (TXT)", expanded=False):
+        st.code(txt_content, language="text")
 
     ec1, ec2, ec3 = st.columns(3)
-
     with ec1:
-        st.download_button(
-            label="⬇ Download TXT Report",
-            data=txt_content,
-            file_name="climate_resilience_briefing.txt",
-            mime="text/plain",
-            use_container_width=True,
-        )
-
+        st.download_button("⬇ Download TXT Report", data=txt_content,
+                           file_name=report_filename("txt"), mime="text/plain",
+                           use_container_width=True)
     with ec2:
-        try:
-            pdf_bytes = generate_pdf_report(scenario_data, results, top_strategy, ood)
-            st.download_button(
-                label="⬇ Download PDF Report",
-                data=pdf_bytes,
-                file_name="climate_resilience_briefing.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-            )
-        except ImportError:
-            st.info("PDF export requires: pip install fpdf2")
-
+        if fpdf_available():
+            try:
+                st.download_button("⬇ Download PDF Report", data=payload_to_pdf(payload),
+                                   file_name=report_filename("pdf"), mime="application/pdf",
+                                   use_container_width=True)
+            except ImportError:
+                st.caption("PDF export unavailable — install fpdf2")
+        else:
+            st.caption("PDF export unavailable — install fpdf2")
     with ec3:
-        st.download_button(
-            label="⬇ Download CSV Data",
-            data=csv_df.to_csv(index=False),
-            file_name="climate_scenario_data.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+        st.download_button("⬇ Download CSV Data", data=csv_bytes,
+                           file_name=report_filename("csv"), mime="text/csv",
+                           use_container_width=True)
+
+
+def render_dev_panel(backend, timings) -> None:
+    with st.sidebar:
+        with st.expander("🛠 Dev / QA", expanded=False):
+            st.caption("Engine wiring")
+            st.write({"source": backend.get("source"), "compare_is_live": backend.get("compare_is_live"),
+                      **backend.get("detail", {})})
+            st.caption("Last computation")
+            total = timings.get("total", 0.0)
+            st.write({"emulator_s": round(timings.get("emulator", 0.0), 4),
+                      "compare_s":  round(timings.get("compare",  0.0), 4),
+                      "total_s":    round(total, 4),
+                      "compare_used": timings.get("compare_used", "n/a"),
+                      "cache": "likely hit" if total < 0.05 else "fresh compute"})
+            if st.button("Clear caches", use_container_width=True):
+                st.cache_data.clear()
+                st.cache_resource.clear()
+                st.rerun()
 
 
 def render_footer() -> None:
-    """Renders the bottom footer."""
     st.divider()
-    st.markdown(
-        """
-        <div style="text-align:center;color:#9ca3af;font-size:0.78rem;
-                    padding:16px 0 8px 0;">
+    st.markdown("""
+        <div style="text-align:center;color:#9ca3af;font-size:.78rem;padding:16px 0 8px 0;">
           🌍 <strong>AI Climate Resilience Sandbox</strong> &nbsp;·&nbsp;
           SDG 13: Climate Action &nbsp;·&nbsp;
           Built for Hackathon MVP &nbsp;·&nbsp;
           <em>Not an operational forecast tool</em>
         </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    """, unsafe_allow_html=True)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
-# ═════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    """
-    Single top-level orchestrator.  All st.* calls happen inside the
-    render_*() functions called from here — no loose UI code at module level.
-    """
-    # Must be the first Streamlit command.
-    st.set_page_config(
-        page_title="AI Climate Resilience Sandbox",
-        page_icon="🌍",
-        layout="wide",
-        initial_sidebar_state="auto",
-    )
+    st.set_page_config(page_title="AI Climate Resilience Sandbox", page_icon="🌍",
+                       layout="wide", initial_sidebar_state="auto")
     _init_session_state()
     _inject_css()
 
     backend    = get_backend()
     hist_stats = load_historical_stats()
 
-    # Sidebar renders widgets; returns current slider/checkbox values.
     sst, rainfall, drought, heat, adapt_dict = render_sidebar(backend)
+    scenario_data = {"sst": sst, "rainfall": rainfall, "drought": drought,
+                     "heat": heat, "adapt_dict": adapt_dict}
 
-    # Core computations — done once and shared across all render functions.
-    emulator = backend["emulator"]
-    results  = emulator(sst, rainfall, drought, heat, adapt_dict)
-    baseline = emulator(sst, rainfall, drought, heat, {"crops": 0, "gw": 0, "irr": 0, "water": 0})
-    adj      = results["adjusted_risk_score"]
+    timings: dict = {}
+    t0       = time.perf_counter()
+    results  = _emulate_cached(sst, rainfall, drought, heat,
+                               adapt_dict["crops"], adapt_dict["gw"],
+                               adapt_dict["irr"],   adapt_dict["water"])
+    baseline = _emulate_cached(sst, rainfall, drought, heat, 0, 0, 0, 0)
+    timings["emulator"] = time.perf_counter() - t0
+    adj = results["adjusted_risk_score"]
+
+    t1 = time.perf_counter()
+    if backend.get("compare_is_live"):
+        try:
+            all_combos = _live_compare_cached(sst, rainfall, drought, heat)
+            if not all_combos:
+                raise ValueError("empty result")
+            timings["compare_used"] = "live"
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Live policy engine failed: %s", exc)
+            st.warning("Live policy engine error — showing local comparison.")
+            all_combos = _fallback_compare_combos(sst, rainfall, drought, heat)
+            timings["compare_used"] = "fallback (after live error)"
+    else:
+        all_combos = _fallback_compare_combos(sst, rainfall, drought, heat)
+        timings["compare_used"] = "fallback"
+    timings["compare"] = time.perf_counter() - t1
+    timings["total"]   = timings["emulator"] + timings["compare"]
+    st.session_state["_timings"] = timings
 
     policy_rules = backend["policy_rules"]()
-    ood          = _is_ood(sst, rainfall, drought, heat, hist_stats)
-    all_combos   = _rank_all_combos(emulator, sst, rainfall, drought, heat)
+    ood_warnings = get_ood_warnings(sst, rainfall, drought, heat, hist_stats)
+    compact      = bool(st.session_state["compact_mode"])
+    map_height   = MAP_HEIGHT_COMPACT   if compact else MAP_HEIGHT
+    radar_height = RADAR_HEIGHT_COMPACT if compact else RADAR_HEIGHT
 
-    scenario_data = {
-        "sst":        sst,
-        "rainfall":   rainfall,
-        "drought":    drought,
-        "heat":       heat,
-        "adapt_dict": adapt_dict,
-    }
-
-    # ── Main area ─────────────────────────────────────────────────────────────
     render_header()
     render_scenario_summary(sst, rainfall, drought, heat, adapt_dict)
-    render_status_alerts(adj, policy_rules, ood)      # above cards — spec §A-3
+    if timings["total"] > SLOW_RESPONSE_SECS:
+        st.caption("⏱ Slow response — results cached for speed")
+    render_status_alerts(adj, policy_rules, ood_warnings)
     render_metric_cards(results, baseline, hist_stats, backend)
 
-    left_col, right_col = st.columns([1.4, 1], gap="large")
-    with left_col:
-        render_risk_map(adj)
-    with right_col:
+    if compact:
+        render_risk_map(adj, height=map_height)
         render_recommendations(adapt_dict, all_combos)
+    else:
+        left_col, right_col = st.columns([1.4, 1], gap="large")
+        with left_col:
+            render_risk_map(adj, height=map_height)
+        with right_col:
+            render_recommendations(adapt_dict, all_combos)
 
-    render_radar_chart(results, baseline)
-    render_zscore_panel(results, hist_stats, backend)
-    render_transparency(results, ood, hist_stats)
-    render_export(scenario_data, results, all_combos, ood)
+    render_radar_chart(results, baseline, height=radar_height)
+    render_zscore_panel(results, hist_stats, backend, policy_rules)
+    render_transparency(results, ood_warnings, hist_stats)
+    render_export(scenario_data, all_combos)
+    render_dev_panel(backend, timings)
     render_footer()
 
 
-main()
+# Production guard — friendly message instead of raw traceback
+try:
+    main()
+except Exception:  # noqa: BLE001
+    logging.exception("Unhandled error in main()")
+    st.error("Something went wrong — adjust inputs or reload the page.")
